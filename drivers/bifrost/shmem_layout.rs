@@ -24,7 +24,7 @@ pub(crate) const SHMEM_N_PAGES: usize = SHMEM_REGION_SIZE / 4096;
 pub(crate) const SHMEM_MAGIC: u32 = 0x48534642;
 /// Layout version stored next to the magic. Bumped whenever the
 /// header layout changes incompatibly.
-pub(crate) const SHMEM_VERSION: u32 = 2;
+pub(crate) const SHMEM_VERSION: u32 = 3;
 
 /// Phase 3a SHMEM sub-region layout (offsets within the 16 MB
 /// region, all 4 KB aligned). Kept in sync with the host's

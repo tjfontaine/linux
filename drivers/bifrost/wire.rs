@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 5b8fc1ac9886a9d540f024de2e27f9bf185c9193667f06e91f6c1a968fd534c9
+// CANONICAL_SHA256: 9f8779b23cebea9ea83daae30d07c1ba076508587b683056bbc02dea9fa9d78b
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -625,7 +625,7 @@ pub const HELLO_REJECT_OTHER: u8 = 99;
 pub const SHMEM_MAGIC: u32 = 0x48534642;
 /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
 /// header layout changes incompatibly.
-pub const SHMEM_VERSION: u32 = 2;
+pub const SHMEM_VERSION: u32 = 3;
 /// 8-byte record header: u32 size, u32 flags.
 pub const SHMEM_RECORD_HDR_SIZE: usize = 8;
 pub const SHMEM_RECORD_FLAG_READY: u32 = 1;
