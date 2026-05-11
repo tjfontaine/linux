@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Bifrost guest driver — virtio device + kprobe/uprobe shim that
+# accepts pre-lowered eBPF programs from the host (project bifrost
+# runs DTrace D scripts, lowers DIF→eBPF on macOS, and ferries the
+# resulting programs into a Linux guest under libkrun for kernel
+# attach + execution). See guest/linux-bifrost/drivers/bifrost/
+# bifrost.rs for the driver implementation, and the project README
+# for the end-to-end story.
+#
+# bool (not tristate): bifrost is intended to ship as part of the
+# guest kernel image (vmlinux), not as a loadable .ko. Building as
+# a module is unsupported because bifrost initializes during boot
+# and consumes EXPORT_SYMBOL_GPL helpers that depend on bifrost-
+# specific kernel patches; pairing kernel + module across versions
+# would just create a vermagic-mismatch trap.
+
+config BIFROST_GUEST
+	bool "Bifrost guest driver (in-tree, built-in)"
+	# Keep this dependency list explicit. Bifrost calls into verifier,
+	# JIT, BTF, kallsyms, kprobe, uprobe, raw-tracepoint, perf-event,
+	# ftrace-direct, and virtio APIs directly; if any of these disappear,
+	# vmlinux can otherwise fail late at link time or boot with a guest
+	# driver that accepts fbt programs but cannot link them.
+	depends on RUST
+	depends on BPF_SYSCALL
+	depends on BPF_JIT
+	depends on BPF_EVENTS
+	depends on KPROBES
+	depends on KPROBE_EVENTS
+	depends on FUNCTION_TRACER
+	depends on DYNAMIC_FTRACE
+	depends on DYNAMIC_FTRACE_WITH_ARGS
+	depends on DYNAMIC_FTRACE_WITH_DIRECT_CALLS
+	depends on UPROBES
+	depends on UPROBE_EVENTS
+	depends on PERF_EVENTS
+	depends on DEBUG_INFO_BTF
+	depends on KALLSYMS
+	depends on VIRTIO
+	default y
+	help
+	  Bifrost guest driver — see drivers/bifrost/bifrost.rs.
+	  Receives eBPF programs from the host over virtio, runs them
+	  through the kernel verifier + JIT, and attaches them as
+	  kprobes/uprobes. Intended to be built into the kernel image
+	  used by libkrun (no module-load step at boot).
+
+	  Say Y here unless you are building a kernel that will not
+	  run under bifrost.

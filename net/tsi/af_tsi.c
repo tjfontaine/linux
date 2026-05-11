@@ -547,6 +547,15 @@ static int tsi_accept(struct socket *sock, struct socket *newsock,
 	struct socket *csocket;
 	struct tsi_sock *tsk;
 	struct tsi_sock *newtsk;
+	/*
+	 * Must initialize to NULL: the `error:` label below does
+	 * `if (nsock) sock_release(nsock)`, but tsi_accept_inet /
+	 * tsi_accept_vsock can return early (sock_alloc fail, peer
+	 * accept fail) without ever writing through `&nsock`, leaving
+	 * stack garbage. Without the initializer the very first accept(2)
+	 * on a TSI listener oopses in sock_release dereferencing a
+	 * userspace-shaped stack pointer.
+	 */
 	struct socket *nsock = NULL;
 	struct sock *sk;
 	int err;
@@ -919,6 +928,59 @@ static int tsi_shutdown(struct socket *sock, int mode)
 	return err;
 }
 
+/*
+ * Mirror commonly-read SOL_SOCKET fields from the inner inet socket onto the
+ * outer TSI sock. This is required because the kernel's do_sock_getsockopt()
+ * unconditionally reads SOL_SOCKET options directly from sock->sk via
+ * sk_getsockopt() and never calls our ops->getsockopt for level==SOL_SOCKET.
+ * Without mirroring, callers that round-trip setsockopt+getsockopt (e.g.
+ * gRPC's c-core verifies SO_REUSEADDR by reading it back) would see 0 even
+ * after a successful set.
+ *
+ * The caller must already hold lock_sock(sk).
+ */
+static void tsi_mirror_sol_socket_field(struct sock *sk, struct sock *src,
+					int optname)
+{
+	switch (optname) {
+	case SO_REUSEADDR:
+		sk->sk_reuse = src->sk_reuse;
+		break;
+	case SO_REUSEPORT:
+		sk->sk_reuseport = src->sk_reuseport;
+		break;
+	case SO_KEEPALIVE:
+		if (sock_flag(src, SOCK_KEEPOPEN))
+			sock_set_flag(sk, SOCK_KEEPOPEN);
+		else
+			sock_reset_flag(sk, SOCK_KEEPOPEN);
+		break;
+	case SO_BROADCAST:
+		if (sock_flag(src, SOCK_BROADCAST))
+			sock_set_flag(sk, SOCK_BROADCAST);
+		else
+			sock_reset_flag(sk, SOCK_BROADCAST);
+		break;
+	case SO_LINGER:
+		if (sock_flag(src, SOCK_LINGER))
+			sock_set_flag(sk, SOCK_LINGER);
+		else
+			sock_reset_flag(sk, SOCK_LINGER);
+		sk->sk_lingertime = src->sk_lingertime;
+		break;
+	case SO_RCVBUF:
+	case SO_RCVBUFFORCE:
+		WRITE_ONCE(sk->sk_rcvbuf, READ_ONCE(src->sk_rcvbuf));
+		break;
+	case SO_SNDBUF:
+	case SO_SNDBUFFORCE:
+		WRITE_ONCE(sk->sk_sndbuf, READ_ONCE(src->sk_sndbuf));
+		break;
+	default:
+		break;
+	}
+}
+
 static int tsi_stream_setsockopt(struct socket *sock, int level, int optname,
 				 sockptr_t optval, unsigned int optlen)
 {
@@ -940,6 +1002,9 @@ static int tsi_stream_setsockopt(struct socket *sock, int level, int optname,
 		if (level == SOL_SOCKET) {
 			err = sock_setsockopt(isocket, level, optname, optval,
 					      optlen);
+			if (!err)
+				tsi_mirror_sol_socket_field(sk, isocket->sk,
+							    optname);
 		} else if (isocket->ops->setsockopt) {
 			err = isocket->ops->setsockopt(isocket, level, optname,
 						       optval, optlen);
@@ -948,8 +1013,39 @@ static int tsi_stream_setsockopt(struct socket *sock, int level, int optname,
 		}
 		break;
 	case S_VSOCK:
-		// TODO implement remote setsockopt
-		err = 0;
+		if (level == SOL_SOCKET) {
+			/*
+			 * The connection is now proxied via vsock, but
+			 * callers can still query SOL_SOCKET options. Apply
+			 * the option to isocket purely for kernel-side
+			 * validation/canonicalization, then mirror onto the
+			 * outer sock so getsockopt round-trips work.
+			 *
+			 * BIFROST FIX: accepted vsock sockets (e.g. via
+			 * tsi_accept_vsock) have NO inner inet socket, so
+			 * isocket is NULL. Without the guard, the upstream
+			 * code dereferences NULL in sock_setsockopt and
+			 * oopses; an earlier fix attempt called
+			 * sock_setsockopt(sock, ...) on the outer sock and
+			 * self-deadlocked because we already hold
+			 * lock_sock(sk) and sk_setsockopt re-acquires it.
+			 * With no inner sock to validate against and no
+			 * safe way to re-lock the outer sk here, silently
+			 * accept the option.
+			 */
+			if (isocket) {
+				err = sock_setsockopt(isocket, level, optname,
+						      optval, optlen);
+				if (!err)
+					tsi_mirror_sol_socket_field(
+						sk, isocket->sk, optname);
+			} else {
+				err = 0;
+			}
+		} else {
+			// TODO implement remote setsockopt
+			err = 0;
+		}
 		break;
 	}
 
@@ -972,12 +1068,18 @@ static int tsi_dgram_setsockopt(struct socket *sock, int level, int optname,
 	pr_debug("%s: s=%p is=%p st=%d\n", __func__, sock, isocket,
 		 tsk->status);
 
+	/* See tsi_stream_setsockopt() for why SOL_SOCKET options must be
+	 * mirrored onto the outer TSI sock.
+	 */
 	switch (tsk->status) {
 	case S_HYBRID:
 	case S_INET:
 		if (level == SOL_SOCKET) {
 			err = sock_setsockopt(isocket, level, optname, optval,
 					      optlen);
+			if (!err)
+				tsi_mirror_sol_socket_field(sk, isocket->sk,
+							    optname);
 		} else if (isocket->ops->setsockopt) {
 			err = isocket->ops->setsockopt(isocket, level, optname,
 						       optval, optlen);
@@ -986,8 +1088,22 @@ static int tsi_dgram_setsockopt(struct socket *sock, int level, int optname,
 		}
 		break;
 	case S_VSOCK:
-		// TODO implement remote setsockopt
-		err = 0;
+		if (level == SOL_SOCKET) {
+			/* Same NULL-isocket guard as the stream variant — see
+			 * the BIFROST FIX comment in tsi_stream_setsockopt. */
+			if (isocket) {
+				err = sock_setsockopt(isocket, level, optname,
+						      optval, optlen);
+				if (!err)
+					tsi_mirror_sol_socket_field(
+						sk, isocket->sk, optname);
+			} else {
+				err = 0;
+			}
+		} else {
+			// TODO implement remote setsockopt
+			err = 0;
+		}
 		break;
 	}
 

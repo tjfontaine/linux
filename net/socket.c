@@ -1570,7 +1570,19 @@ int __sock_create(struct net *net, int family, int type, int protocol,
 #endif
 
 #ifdef CONFIG_TSI
-	if (!kern && (type == SOCK_STREAM || type == SOCK_DGRAM)) {
+	/*
+	 * `type` carries flag bits (SOCK_NONBLOCK, SOCK_CLOEXEC) ORed
+	 * into the low nibble that identifies the actual socket type.
+	 * Mask with SOCK_TYPE_MASK before comparing -- postgres and
+	 * other production servers create their listening socket with
+	 * `socket(AF_INET, SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0)`,
+	 * which made the original `type == SOCK_STREAM` check fail and
+	 * silently skipped the AF_INET -> AF_TSI hijack -- the listener
+	 * then bound only inside the guest, never reaching the host
+	 * port-forward set up by `krun_set_port_map`.
+	 */
+	if (!kern && ((type & SOCK_TYPE_MASK) == SOCK_STREAM ||
+		      (type & SOCK_TYPE_MASK) == SOCK_DGRAM)) {
 		if (family == AF_INET && tsi_hijack) {
 			pr_debug("%s - tsi: hijacking AF_INET socket\n",
 				current->comm);

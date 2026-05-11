@@ -21,7 +21,10 @@ static bool bpf_verifier_log_attr_valid(const struct bpf_verifier_log *log)
 	/* log buf without log_level is meaningless */
 	if (log->ubuf && log->level == 0)
 		return false;
-	if (log->level & ~BPF_LOG_MASK)
+	/* Bifrost: allow BPF_LOG_KERNEL to be passed in via attr.log_level
+	 * directly, so kernel-mode callers (bifrost_verify_prog) can route
+	 * verifier output to dmesg without setting up a userspace log buf. */
+	if (log->level & ~(BPF_LOG_MASK | BPF_LOG_KERNEL))
 		return false;
 	if (log->len_total > UINT_MAX >> 2)
 		return false;

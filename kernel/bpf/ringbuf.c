@@ -804,3 +804,68 @@ const struct bpf_func_proto bpf_user_ringbuf_drain_proto = {
 	.arg3_type	= ARG_PTR_TO_STACK_OR_NULL,
 	.arg4_type	= ARG_ANYTHING,
 };
+
+/*
+ * Bifrost kernel-side consumer for kernel-producer bpf_ringbuf
+ * maps. Walks records between consumer_pos and producer_pos,
+ * fires the supplied callback for each valid sample, advances
+ * consumer_pos.
+ *
+ * Returns the number of samples consumed, or -EINVAL/-EBUSY.
+ * The callback returns 0 to continue, nonzero to stop early.
+ */
+int bifrost_ringbuf_consume(struct bpf_map *map,
+			    int (*cb)(void *data, u32 len, void *ctx),
+			    void *ctx)
+{
+	struct bpf_ringbuf *rb;
+	unsigned long cons_pos, prod_pos;
+	int n_consumed = 0;
+	int busy = 0;
+
+	if (!map || map->map_type != BPF_MAP_TYPE_RINGBUF)
+		return -EINVAL;
+
+	rb = container_of(map, struct bpf_ringbuf_map, map)->rb;
+	if (!rb)
+		return -EINVAL;
+
+	if (!atomic_try_cmpxchg(&rb->busy, &busy, 1))
+		return -EBUSY;
+
+	cons_pos = smp_load_acquire(&rb->consumer_pos);
+	prod_pos = smp_load_acquire(&rb->producer_pos);
+
+	while (cons_pos < prod_pos) {
+		u32 *hdr;
+		u32 hdr_len, sample_len, total_len;
+
+		hdr = (u32 *)((uintptr_t)rb->data + ((uintptr_t)cons_pos & rb->mask));
+		hdr_len = smp_load_acquire(hdr);
+
+		if (hdr_len & BPF_RINGBUF_BUSY_BIT)
+			break;
+
+		sample_len = hdr_len & ~(BPF_RINGBUF_BUSY_BIT | BPF_RINGBUF_DISCARD_BIT);
+		total_len = round_up(sample_len + BPF_RINGBUF_HDR_SZ, 8);
+
+		if (total_len > prod_pos - cons_pos)
+			break;
+
+		if (!(hdr_len & BPF_RINGBUF_DISCARD_BIT)) {
+			void *sample = (void *)((uintptr_t)rb->data +
+				((uintptr_t)(cons_pos + BPF_RINGBUF_HDR_SZ) & rb->mask));
+			int rc = cb(sample, sample_len, ctx);
+			if (rc)
+				break;
+		}
+
+		cons_pos += total_len;
+		n_consumed++;
+	}
+
+	smp_store_release(&rb->consumer_pos, cons_pos);
+	atomic_set(&rb->busy, 0);
+	return n_consumed;
+}
+EXPORT_SYMBOL_GPL(bifrost_ringbuf_consume);

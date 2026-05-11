@@ -11395,6 +11395,7 @@ enum special_kfunc_type {
 	KF_bpf_preempt_enable,
 	KF_bpf_iter_css_task_new,
 	KF_bpf_session_cookie,
+	KF_bifrost_kfunc_shmem_reserve,
 };
 
 BTF_SET_START(special_kfunc_set)
@@ -11422,6 +11423,7 @@ BTF_ID(func, bpf_wq_set_callback_impl)
 #ifdef CONFIG_CGROUPS
 BTF_ID(func, bpf_iter_css_task_new)
 #endif
+BTF_ID(func, bifrost_kfunc_shmem_reserve)
 BTF_SET_END(special_kfunc_set)
 
 BTF_ID_LIST(special_kfunc_list)
@@ -11460,6 +11462,7 @@ BTF_ID(func, bpf_session_cookie)
 #else
 BTF_ID_UNUSED
 #endif
+BTF_ID(func, bifrost_kfunc_shmem_reserve)
 
 static bool is_kfunc_ret_null(struct bpf_kfunc_call_arg_meta *meta)
 {
@@ -12890,6 +12893,22 @@ static int check_kfunc_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
 				regs[BPF_REG_0].type = PTR_TO_BTF_ID | PTR_UNTRUSTED;
 				regs[BPF_REG_0].btf = desc_btf;
 				regs[BPF_REG_0].btf_id = meta.arg_constant.value;
+			} else if (meta.func_id == special_kfunc_list[KF_bifrost_kfunc_shmem_reserve]) {
+				/* bifrost SHMEM event-ringbuf reserve: returns a
+				 * writable PTR_TO_MEM of size `size__k` (the
+				 * constant arg, tracked by the verifier via the
+				 * __k suffix), or NULL. Mirrors the
+				 * bpf_dynptr_slice_rdwr shape. KF_RET_NULL on the
+				 * BTF_ID_FLAGS line adds PTR_MAYBE_NULL.
+				 */
+				mark_reg_known_zero(env, regs, BPF_REG_0);
+				if (!meta.arg_constant.found) {
+					verbose(env,
+						"verifier internal error: bifrost_kfunc_shmem_reserve no constant size\n");
+					return -EFAULT;
+				}
+				regs[BPF_REG_0].mem_size = meta.arg_constant.value;
+				regs[BPF_REG_0].type = PTR_TO_MEM;
 			} else if (meta.func_id == special_kfunc_list[KF_bpf_dynptr_slice] ||
 				   meta.func_id == special_kfunc_list[KF_bpf_dynptr_slice_rdwr]) {
 				enum bpf_type_flag type_flag = get_dynptr_type_flag(meta.initialized_dynptr.type);

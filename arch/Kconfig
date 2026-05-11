@@ -133,7 +133,7 @@ config KPROBES_ON_FTRACE
 	  optimize on top of function tracing.
 
 config UPROBES
-	def_bool n
+	def_bool y if ARCH_SUPPORTS_UPROBES
 	depends on ARCH_SUPPORTS_UPROBES
 	help
 	  Uprobes is the user-space counterpart to kprobes: they

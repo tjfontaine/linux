@@ -35,9 +35,20 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_SK_MSG, sk_msg,
 BPF_PROG_TYPE(BPF_PROG_TYPE_FLOW_DISSECTOR, flow_dissector,
 	      struct __sk_buff, struct bpf_flow_dissector)
 #endif
-#ifdef CONFIG_BPF_EVENTS
+/*
+ * BPF_PROG_TYPE_KPROBE is registered both under CONFIG_BPF_EVENTS
+ * (canonical, ops in kernel/trace/bpf_trace.c) and under
+ * CONFIG_BIFROST_GUEST (minimal ops in kernel/bpf/helpers.c, gated
+ * to the BPF_EVENTS=n case there). This lets bifrost verify and JIT
+ * BPF_PROG_TYPE_KPROBE programs without pulling in the FTRACE /
+ * TRACING / BPF_EVENTS tracefs surface that the bifrost guest
+ * driver doesn't use.
+ */
+#if defined(CONFIG_BPF_EVENTS) || defined(CONFIG_BIFROST_GUEST)
 BPF_PROG_TYPE(BPF_PROG_TYPE_KPROBE, kprobe,
 	      bpf_user_pt_regs_t, struct pt_regs)
+#endif
+#ifdef CONFIG_BPF_EVENTS
 BPF_PROG_TYPE(BPF_PROG_TYPE_TRACEPOINT, tracepoint,
 	      __u64, u64)
 BPF_PROG_TYPE(BPF_PROG_TYPE_PERF_EVENT, perf_event,

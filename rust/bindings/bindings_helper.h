@@ -21,6 +21,131 @@
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
+#include <linux/virtio.h>
+#include <linux/virtio_config.h>
+#include <linux/kprobes.h>
+#include <linux/bpf.h>
+#include <linux/filter.h>
+#include <linux/scatterlist.h>
+#include <linux/uprobes.h>
+#include <linux/namei.h>
+
+/* Bifrost helper-proto resolver, defined in kernel/bpf/helpers.c.
+ * Exposed here so bindgen picks it up for the bifrost_guest module. */
+extern const struct bpf_func_proto *bifrost_get_func_proto(enum bpf_func_id func_id,
+                                                           const struct bpf_prog *prog);
+/* Bifrost vmlinux BTF range accessor (kernel/bpf/helpers.c). */
+extern const void *bifrost_btf_data(unsigned long *size);
+/* Bifrost kallsyms walker — invokes cb(data, name, addr) for each symbol. */
+extern int bifrost_walk_kallsyms(int (*cb)(void *, const char *, unsigned long), void *data);
+/* Bifrost stack walker — wraps stack_trace_save_regs (kernel-internal). */
+extern unsigned int bifrost_stack_walk(struct pt_regs *regs, unsigned long *store,
+				       unsigned int nr, unsigned int skipnr);
+/* Bifrost exe-path helper — writes the given task's executable path
+ * (mm->exe_file's d_path) into `buf`. Returns bytes written, 0 if
+ * unavailable, negative errno on error. Companion to gustack — gives
+ * the host the ELF file to symbolicate frames against. */
+extern int bifrost_task_exe_path(struct task_struct *task, char *buf, unsigned int size);
+/* Bifrost VMA-table emitter — packs the task's file-backed VMAs
+ * into `buf`. See `bifrost_emit_vma_table` in kernel/bpf/helpers.c
+ * for wire format. Returns bytes written, 0 if no mm/trylock failed,
+ * or negative errno on buffer too small. */
+extern int bifrost_emit_vma_table(struct task_struct *task, char *buf, unsigned int size);
+/* Bifrost SHMEM allocator — vmalloc-backed (non-contiguous physical,
+ * contiguous kernel-virt). Caller provides a `pfns` array; the
+ * helper walks vmalloc_to_pfn for each PAGE_SIZE chunk. The host
+ * derives per-page host VAs via vm-memory using each PFN. */
+extern void *bifrost_alloc_shmem(unsigned long size, unsigned long *pfns,
+				  unsigned long pfns_capacity,
+				  unsigned long *out_n_pages);
+extern void bifrost_free_shmem(void *addr, unsigned long size);
+/* Bifrost SHMEM event-ringbuf publisher. The bifrost_guest module
+ * calls this once after SHMEM_INIT has been acked by the host so
+ * the bifrost_kfunc_shmem_reserve/_submit kfuncs can find the
+ * region. Phase 3a extends with BTF/kallsyms/VMA-cache sub-region
+ * offsets so the host can read them directly out of SHMEM
+ * (replacing op=4/op=5 chunked virtqueue transport). Returns 0
+ * on success, -EINVAL on bad args. */
+extern int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
+				      unsigned long ringbuf_off,
+				      unsigned long ringbuf_len,
+				      unsigned long btf_off,
+				      unsigned long btf_len,
+				      unsigned long ksyms_off,
+				      unsigned long ksyms_len,
+				      unsigned long vma_cache_off,
+				      unsigned long vma_cache_len);
+/* Phase 4 doorbell wiring: bifrost_guest module passes a kick fn +
+ * private cookie; bifrost_kfunc_shmem_kick invokes them when the
+ * consumer has fallen behind. The kick fn does virtqueue_kick on
+ * the dedicated vq_doorbell. */
+typedef void (*bifrost_kick_fn_t)(void *priv);
+extern int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv);
+/* Kernel-context SHMEM ringbuf reserve/submit. Callable from the
+ * bifrost guest module's worker thread (e.g. push_agg_snapshot)
+ * to publish records into the SHMEM event ringbuf without going
+ * through BPF. Same atomic CAS + wraparound semantics as the BPF
+ * kfunc form `bifrost_kfunc_shmem_reserve`. */
+extern void *bifrost_shmem_reserve_kernel(unsigned int size);
+extern void bifrost_shmem_submit_kernel(void *ptr);
+/* Bifrost task lookup by tgid. Returns NULL if no such task; caller
+ * must put_task_struct via bifrost_put_task. */
+extern struct task_struct *bifrost_find_task_by_tgid(unsigned int tgid);
+extern void bifrost_put_task(struct task_struct *t);
+/* Bifrost map allocation shim (kernel/bpf/syscall.c). Returns a real
+ * bpf_map (PERCPU_ARRAY / HASH / PERCPU_HASH / etc.) with .ops set so
+ * subsequent JIT'd eBPF can call bpf_map_lookup_elem / update_elem
+ * natively. Replaces the legacy custom bifrost_agg_inc helper path. */
+extern struct bpf_map *bifrost_alloc_map(unsigned int map_type,
+					 unsigned int key_size,
+					 unsigned int value_size,
+					 unsigned int max_entries);
+extern void bifrost_free_map(struct bpf_map *map);
+/* In-kernel readback shims for the snapshot worker. The standard
+ * `bpf_map_lookup_elem` C function isn't EXPORT_SYMBOL'd. */
+extern void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key);
+extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key);
+/* Bifrost per-cpu-aware u64 reader for the snapshot worker. For
+ * PERCPU_ARRAY / PERCPU_HASH maps sums all per-cpu slots into a
+ * single u64; for non-percpu maps falls back to a single
+ * map_lookup_elem read. */
+extern int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, unsigned long long *out_sum);
+/* MIN/MAX reduce across per-cpu slots. Treat per-cpu value 0 as
+ * sentinel for "this CPU never wrote" and skip it; -ENOENT if no
+ * CPU has a non-zero value. value_size must be 8.
+ */
+extern int bifrost_map_lookup_min_u64(struct bpf_map *map, const void *key, unsigned long long *out_min);
+extern int bifrost_map_lookup_max_u64(struct bpf_map *map, const void *key, unsigned long long *out_max);
+/* AVG: per-cpu slot is [sum:u64][count:u64] (value_size=16). Sums
+ * across CPUs, returns sum/count. -ENOENT if total count is 0.
+ */
+extern int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, unsigned long long *out_avg);
+/* Bifrost verifier shim — runs the standard kernel BPF verifier
+ * via bpf_check, with verbose output to dmesg via BPF_LOG_KERNEL.
+ * Caller must (a) bpf_prog_alloc + set type/len + copy insns,
+ * (b) for any LD_DW_IMM with src_reg=BPF_PSEUDO_MAP_FD ensure
+ * imm holds a real fd resolvable via __bpf_map_get. */
+extern int bifrost_verify_prog(struct bpf_prog **prog);
+/* Bifrost helper to set prog->type AND prog->aux->ops together via
+ * the standard find_prog_type() table. Required before
+ * bifrost_verify_prog for prog types whose verifier path consults
+ * prog->aux->ops (notably BPF_PROG_TYPE_TRACING for fentry/fexit —
+ * mark_fastcall_pattern_for_call faults on NULL aux->ops there). */
+extern int bifrost_set_prog_type(struct bpf_prog *prog, enum bpf_prog_type type);
+/* Anon-inode-fd allocator wrapping bpf_map_new_fd; lets the guest
+ * module bind a real fd to each bpf_map for the verifier's
+ * resolution pass. Returns the fd or a negative errno. */
+extern int bifrost_map_get_fd(struct bpf_map *map, int flags);
+/* close_fd from fs/file.c — releases an fd in the current task's
+ * file table. Used to release fds bifrost_map_get_fd allocates
+ * once the verifier has resolved them in the program. */
+extern int close_fd(unsigned int fd);
+/* __cond_resched: yield CPU if needed. Used inside the legacy
+ * chunked-send spin loops (now retired post-Phase 3a) and any
+ * future long-running kernel loops that need to play nice with
+ * RCU. The kernel's `cond_resched()` is a preprocessor macro
+ * that wraps this. */
+extern int __cond_resched(void);
 
 /* `bindgen` gets confused at certain things. */
 const size_t RUST_CONST_HELPER_ARCH_SLAB_MINALIGN = ARCH_SLAB_MINALIGN;

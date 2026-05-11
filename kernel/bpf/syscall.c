@@ -6037,3 +6037,335 @@ static int __init bpf_syscall_sysctl_init(void)
 }
 late_initcall(bpf_syscall_sysctl_init);
 #endif /* CONFIG_SYSCTL */
+
+/*
+ * Bifrost map allocation shim. Bypasses the BPF_MAP_CREATE syscall
+ * path (which requires a userspace `union bpf_attr` and capability
+ * checks) and directly invokes the per-type map_alloc op. Returns a
+ * fully-initialized bpf_map* whose `ops` are set so that subsequent
+ * bpf_map_lookup_elem / bpf_map_update_elem from JIT'd eBPF Just Work.
+ *
+ * No security checks: this is for in-kernel use by the bifrost guest
+ * driver, which is itself loaded by privileged init. The intent is to
+ * let bifrost replace its custom bifrost_agg_inc helpers with native
+ * PERCPU_ARRAY / PERCPU_HASH / HASH backed by real kernel maps.
+ */
+struct bpf_map *bifrost_alloc_map(u32 map_type, u32 key_size,
+				  u32 value_size, u32 max_entries)
+{
+	union bpf_attr attr = {};
+	const struct bpf_map_ops *ops;
+	struct bpf_map *map;
+	int err;
+
+	if (map_type >= ARRAY_SIZE(bpf_map_types))
+		return ERR_PTR(-EINVAL);
+	ops = bpf_map_types[map_type];
+	if (!ops || !ops->map_alloc)
+		return ERR_PTR(-EINVAL);
+
+	attr.map_type = map_type;
+	attr.key_size = key_size;
+	attr.value_size = value_size;
+	attr.max_entries = max_entries;
+
+	if (ops->map_alloc_check) {
+		err = ops->map_alloc_check(&attr);
+		if (err)
+			return ERR_PTR(err);
+	}
+	map = ops->map_alloc(&attr);
+	if (IS_ERR(map))
+		return map;
+	map->ops = ops;
+	map->map_type = map_type;
+	atomic64_set(&map->refcnt, 1);
+	atomic64_set(&map->usercnt, 1);
+	mutex_init(&map->freeze_mutex);
+	spin_lock_init(&map->owner_lock);
+	return map;
+}
+EXPORT_SYMBOL_GPL(bifrost_alloc_map);
+
+/*
+ * Bifrost map free counterpart — releases storage allocated by
+ * bifrost_alloc_map. Calls the per-type map_free op.
+ */
+void bifrost_free_map(struct bpf_map *map)
+{
+	if (!map)
+		return;
+	if (map->ops && map->ops->map_free)
+		map->ops->map_free(map);
+}
+EXPORT_SYMBOL_GPL(bifrost_free_map);
+
+/*
+ * Bifrost map lookup shim — calls map.ops->map_lookup_elem so the
+ * bifrost guest driver can read agg values from kernel context (e.g.
+ * a periodic snapshot worker) without re-implementing each map type's
+ * lookup logic.
+ */
+void *bifrost_map_lookup_elem(struct bpf_map *map, const void *key)
+{
+	if (!map || !map->ops || !map->ops->map_lookup_elem)
+		return NULL;
+	return map->ops->map_lookup_elem(map, (void *)key);
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_elem);
+
+/*
+ * Bifrost get_next_key shim — for iterating HASH/PERCPU_HASH entries
+ * during snapshots. Pass `key=NULL` for the first key.
+ */
+int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
+{
+	if (!map || !map->ops || !map->ops->map_get_next_key)
+		return -EINVAL;
+	return map->ops->map_get_next_key(map, key, next_key);
+}
+EXPORT_SYMBOL_GPL(bifrost_map_get_next_key);
+
+/*
+ * Bifrost agg-snapshot reader. For PERCPU_ARRAY / PERCPU_HASH maps,
+ * sum the per-cpu slots into a single u64 (we only support u64
+ * agg values for now). For non-percpu maps, fall back to a single
+ * map_lookup_elem read.
+ *
+ * Returns 0 on success and writes `*out_sum`. -ENOENT if the key is
+ * absent. -EINVAL on shape mismatch.
+ *
+ * Why this lives in a shim and not in the guest module: per-cpu
+ * iteration uses `for_each_possible_cpu` and `per_cpu_ptr`, which
+ * are kernel-internal macros. Easier to expose a single C helper
+ * than recreate them via bindgen.
+ */
+int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, u64 *out_sum)
+{
+	void *val_ptr;
+	int cpu;
+
+	if (!map || !map->ops || !out_sum)
+		return -EINVAL;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		u64 sum = 0;
+		bool any = false;
+		for_each_possible_cpu(cpu) {
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (val_ptr) {
+				sum += *(u64 *)val_ptr;
+				any = true;
+			}
+		}
+		if (!any)
+			return -ENOENT;
+		*out_sum = sum;
+		return 0;
+	}
+
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	*out_sum = *(u64 *)val_ptr;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_sum_u64);
+
+/*
+ * Per-cpu reduce shims for MIN/MAX/AVG aggregations. Same shape
+ * as bifrost_map_lookup_sum_u64 but reduce by min/max instead of
+ * sum, OR (for AVG) treat each per-cpu slot as a 16-byte
+ * [sum:u64][count:u64] pair and produce sum / count.
+ *
+ * MIN/MAX skip per-cpu slots whose value is 0 (sentinel for "this
+ * CPU never wrote") so an unhit aggregation key reads as -ENOENT
+ * rather than 0. AVG returns 0 if no CPU has a count > 0.
+ */
+int bifrost_map_lookup_min_u64(struct bpf_map *map, const void *key, u64 *out_min)
+{
+	void *val_ptr;
+	int cpu;
+
+	if (!map || !map->ops || !out_min)
+		return -EINVAL;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		u64 minv = U64_MAX;
+		bool any = false;
+		for_each_possible_cpu(cpu) {
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (val_ptr) {
+				u64 v = *(u64 *)val_ptr;
+				if (v == 0)
+					continue;
+				if (!any || v < minv)
+					minv = v;
+				any = true;
+			}
+		}
+		if (!any)
+			return -ENOENT;
+		*out_min = minv;
+		return 0;
+	}
+
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	*out_min = *(u64 *)val_ptr;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_min_u64);
+
+int bifrost_map_lookup_max_u64(struct bpf_map *map, const void *key, u64 *out_max)
+{
+	void *val_ptr;
+	int cpu;
+
+	if (!map || !map->ops || !out_max)
+		return -EINVAL;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		u64 maxv = 0;
+		bool any = false;
+		for_each_possible_cpu(cpu) {
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (val_ptr) {
+				u64 v = *(u64 *)val_ptr;
+				if (v == 0)
+					continue;
+				if (!any || v > maxv)
+					maxv = v;
+				any = true;
+			}
+		}
+		if (!any)
+			return -ENOENT;
+		*out_max = maxv;
+		return 0;
+	}
+
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	*out_max = *(u64 *)val_ptr;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_max_u64);
+
+/*
+ * AVG storage layout per per-cpu slot is [sum:u64][count:u64] (16
+ * bytes; map value_size must be 16). We sum sums + sum counts, then
+ * return total_sum / total_count. Returns -ENOENT if total_count == 0.
+ */
+int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, u64 *out_avg)
+{
+	void *val_ptr;
+	int cpu;
+
+	if (!map || !map->ops || !out_avg)
+		return -EINVAL;
+	if (map->value_size < 16)
+		return -EINVAL;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		u64 sum = 0, count = 0;
+		for_each_possible_cpu(cpu) {
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (val_ptr) {
+				sum   += ((u64 *)val_ptr)[0];
+				count += ((u64 *)val_ptr)[1];
+			}
+		}
+		if (count == 0)
+			return -ENOENT;
+		*out_avg = sum / count;
+		return 0;
+	}
+
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	{
+		u64 sum   = ((u64 *)val_ptr)[0];
+		u64 count = ((u64 *)val_ptr)[1];
+		if (count == 0)
+			return -ENOENT;
+		*out_avg = sum / count;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_avg_u64);
+
+/*
+ * Bifrost verifier shim. Runs the standard kernel BPF verifier
+ * against a pre-loaded bpf_prog using `bpf_check`, with output
+ * directed to the kernel log via `BPF_LOG_KERNEL`. Returns 0 on
+ * accept, errno on reject. Verifier verbose log lands in dmesg.
+ */
+int bifrost_verify_prog(struct bpf_prog **prog)
+{
+	union bpf_attr attr = {};
+	bpfptr_t uattr;
+
+	attr.log_level = BPF_LOG_KERNEL;
+	uattr = make_bpfptr((unsigned long)&attr, true);
+
+	return bpf_check(prog, &attr, uattr, 0);
+}
+EXPORT_SYMBOL_GPL(bifrost_verify_prog);
+
+/*
+ * Bifrost helper to set prog->type AND prog->aux->ops together, using
+ * the standard find_prog_type() table. The bifrost driver loads BPF
+ * programs in-kernel (no userspace bpf() syscall path), so without
+ * this helper it would have to either duplicate the bpf_prog_types[]
+ * registration table or hand-set prog->aux->ops to a hard-coded
+ * bpf_prog_ops* — both of which break when new prog types are added
+ * upstream. Going through find_prog_type() keeps the driver agnostic.
+ *
+ * Required for BPF_PROG_TYPE_TRACING fentry/fexit attach: without
+ * prog->aux->ops set, parts of the verifier that consult aux->ops
+ * (e.g. mark_fastcall_pattern_for_call's helper-proto resolution
+ * path for TRACING progs) fault on NULL deref.
+ *
+ * Returns 0 on success, -EINVAL if `type` isn't a known prog type.
+ * Should be called BEFORE bifrost_verify_prog/bpf_check.
+ */
+int bifrost_set_prog_type(struct bpf_prog *prog, enum bpf_prog_type type)
+{
+	return find_prog_type(type, prog);
+}
+EXPORT_SYMBOL_GPL(bifrost_set_prog_type);
+
+/*
+ * Bifrost map-fd allocation shim. Wraps `bpf_map_new_fd` with a
+ * refcount bump so the caller can hold a kernel pointer to the
+ * map past the fd's close.
+ */
+int bifrost_map_get_fd(struct bpf_map *map, int flags)
+{
+	int ret;
+
+	if (!map)
+		return -EINVAL;
+	bpf_map_inc_with_uref(map);
+	ret = bpf_map_new_fd(map, flags);
+	if (ret < 0)
+		bpf_map_put_with_uref(map);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_get_fd);
