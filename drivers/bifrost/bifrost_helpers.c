@@ -659,39 +659,6 @@ out:
 }
 EXPORT_SYMBOL_GPL(bifrost_helper_resolve_usdt);
 
-int bifrost_helper_resolve_usdt_path(const char *path,
-				     const u8 *provider, u32 provider_len,
-				     const u8 *probe, u32 probe_len,
-				     u64 *out_pc, u64 *out_sema,
-				     struct inode **out_inode)
-{
-	struct file *file;
-	struct inode *inode;
-	int rc;
-
-	if (!path || !out_inode)
-		return -EINVAL;
-
-	file = filp_open(path, O_RDONLY, 0);
-	if (IS_ERR(file))
-		return (int)PTR_ERR(file);
-
-	rc = bifrost_helper_resolve_usdt(file, provider, provider_len,
-					 probe, probe_len, out_pc, out_sema);
-	if (rc) {
-		fput(file);
-		return rc;
-	}
-
-	inode = igrab(file_inode(file));
-	fput(file);
-	if (!inode)
-		return -ENOENT;
-	*out_inode = inode;
-	return 0;
-}
-EXPORT_SYMBOL_GPL(bifrost_helper_resolve_usdt_path);
-
 /*
  * Pack the ELF function symbol table of `file` into `buf` for the
  * gustack symbolicator on the host.  Wire format mirrors the
@@ -1212,10 +1179,6 @@ static const struct bifrost_kfunc_decl BIFROST_KFUNC_MANIFEST[] = {
 	{
 		"bifrost_helper_resolve_usdt",
 		"int (struct file *, const u8 *, u32, const u8 *, u32, u64 *, u64 *)",
-	},
-	{
-		"bifrost_helper_resolve_usdt_path",
-		"int (const char *, const u8 *, u32, const u8 *, u32, u64 *, u64 *, struct inode **)",
 	},
 	{
 		"bifrost_helper_emit_symtab",

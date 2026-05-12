@@ -508,10 +508,6 @@ const BIFROST_KFUNC_EXPECTED: &[KfuncDecl] = &[
         sig: b"int (struct file *, const u8 *, u32, const u8 *, u32, u64 *, u64 *)",
     },
     KfuncDecl {
-        name: b"bifrost_helper_resolve_usdt_path",
-        sig: b"int (const char *, const u8 *, u32, const u8 *, u32, u64 *, u64 *, struct inode **)",
-    },
-    KfuncDecl {
         name: b"bifrost_helper_emit_symtab",
         sig: b"int (struct file *, u8 *, u32, u32, u32 *)",
     },
@@ -647,16 +643,6 @@ extern "C" {
         probe_name_len: u32,
         out_pc_file_offset: *mut u64,
         out_semaphore_file_offset: *mut u64,
-    ) -> c_int;
-    fn bifrost_helper_resolve_usdt_path(
-        path: *const c_char,
-        provider_name: *const u8,
-        provider_name_len: u32,
-        probe_name: *const u8,
-        probe_name_len: u32,
-        out_pc_file_offset: *mut u64,
-        out_semaphore_file_offset: *mut u64,
-        out_inode: *mut *mut bindings::inode,
     ) -> c_int;
     /// C helper — pack the ELF function-symbol table of `file` into
     /// `buf` for the host's gustack symbolicator.  Wire format is
@@ -3012,8 +2998,7 @@ unsafe fn attach_slot_usdt(
     }
     let mut pc_off: u64 = 0;
     let mut sema_off: u64 = 0;
-    let mut pinned: *mut bindings::inode = core::ptr::null_mut();
-    let task = if !basename.is_empty() && basename[0] == b'/' {
+    let (task, pinned) = if !basename.is_empty() && basename[0] == b'/' {
         let mut path_buf = [0u8; 257];
         if basename.len() > 256 {
             pr_err!(
@@ -3026,15 +3011,29 @@ unsafe fn attach_slot_usdt(
         }
         let len = basename.len();
         path_buf[..len].copy_from_slice(&basename[..len]);
-        let rc = bifrost_helper_resolve_usdt_path(
+        let file = bindings::filp_open(
             path_buf.as_ptr() as *const c_char,
+            bindings::O_RDONLY as c_int,
+            0,
+        );
+        let raw_file = file as isize;
+        if (-4096..0).contains(&raw_file) || file.is_null() {
+            pr_err!(
+                "bifrost_guest: usdt slot[{}] open path '{}' failed: {}\n",
+                slot,
+                core::str::from_utf8(basename).unwrap_or("?"),
+                raw_file
+            );
+            return;
+        }
+        let rc = bifrost_helper_resolve_usdt(
+            file,
             sdt_provider.as_ptr(),
             sdt_provider.len() as u32,
             sdt_probe.as_ptr(),
             sdt_probe.len() as u32,
             &mut pc_off,
             &mut sema_off,
-            &mut pinned,
         );
         if rc != 0 {
             pr_err!(
@@ -3045,9 +3044,20 @@ unsafe fn attach_slot_usdt(
                 core::str::from_utf8(basename).unwrap_or("?"),
                 rc
             );
+            fput(file);
             return;
         }
-        core::ptr::null_mut()
+        let pinned = igrab((*file).f_inode);
+        fput(file);
+        if pinned.is_null() {
+            pr_err!(
+                "bifrost_guest: usdt slot[{}] path '{}' inode pin failed\n",
+                slot,
+                core::str::from_utf8(basename).unwrap_or("?")
+            );
+            return;
+        }
+        (core::ptr::null_mut(), pinned)
     } else {
         let task = find_task_by_comm(basename);
         if task.is_null() {
@@ -3084,9 +3094,9 @@ unsafe fn attach_slot_usdt(
             return;
         }
         let exe_inode = (*exe).f_inode;
-        pinned = igrab(exe_inode);
+        let pinned = igrab(exe_inode);
         fput(exe);
-        task
+        (task, pinned)
     };
     pr_info!(
         "bifrost_guest: usdt slot[{}] resolved {}:{} pc=+0x{:x} sema=+0x{:x}\n",
