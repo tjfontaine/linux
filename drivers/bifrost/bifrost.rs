@@ -23,6 +23,10 @@
 //   load_prog_parse.rs       bounded LOAD_PROG payload parser
 //   slots.rs                 heap-backed probe slot table + leases
 //   symtab_snapshot.rs       SHMEM side-channel symbol table pushes
+//   agg_snapshot.rs          SHMEM aggregation snapshots
+//   control_reply.rs         LOAD_PROG completion + ctrl repost
+//   shmem_init.rs            SHMEM_INIT event publication
+//   uprobe_handlers.rs       shared uprobe/uretprobe dispatch
 //
 // Pending (each requires a kernel rebuild + per-attach demo sweep
 // to land safely; deferred until that build cycle is available):
@@ -62,16 +66,20 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 mod bpf_consts;
+mod agg_snapshot;
+mod control_reply;
 mod kfunc_manifest;
 mod load_prog_parse;
 mod path_helpers;
 mod record_writer;
+mod shmem_init;
 mod shmem_layout;
 mod shmem_publish;
 mod slots;
 mod symtab_snapshot;
 mod task_helpers;
 mod types;
+mod uprobe_handlers;
 // wire.rs is a SYMLINK to the canonical bifrost-wire crate at
 // host/bifrost-wire/src/lib.rs.  The kernel rust build composes
 // it as a sibling module; the `unreachable_pub` warning fires
@@ -81,26 +89,27 @@ mod types;
 // visibility consistent across all consumers.
 #[allow(unreachable_pub)]
 mod wire;
-use bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF};
+use agg_snapshot::push_agg_snapshot;
+use control_reply::complete_load_prog;
 use load_prog_parse::validate_load_prog_cmd;
 use path_helpers::path_basename;
-use record_writer::RecordWriter;
+use shmem_init::send_shmem_init;
 use shmem_publish::{populate_shmem_btf, populate_shmem_kallsyms};
 use slots::{
-    bifrost_slots_init, slot_lease_new, slots_ensure, slots_mut, BifrostUprobe,
-    BIFROST_NUM_KPROBES, INITIAL_SLOT_HINT,
+    bifrost_slots_init, slot_lease_new, slots_ensure, slots_mut, BIFROST_NUM_KPROBES,
+    INITIAL_SLOT_HINT,
 };
 use symtab_snapshot::push_symtab_snapshot_cb;
 use task_helpers::{find_task_by_comm, put_task_ref};
 use types::{BifrostCmd, BpfInsn, MapDef};
+use uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
 use shmem_layout::{
     SHMEM_BTF_CAP, SHMEM_BTF_OFF, SHMEM_HDR_LEN, SHMEM_HDR_OFF, SHMEM_KSYMS_CAP, SHMEM_KSYMS_OFF,
     SHMEM_MAGIC, SHMEM_N_PAGES, SHMEM_REGION_SIZE, SHMEM_RINGBUF_LEN, SHMEM_RINGBUF_OFF,
     SHMEM_VERSION, SHMEM_VMA_CACHE_LEN, SHMEM_VMA_CACHE_OFF,
 };
 use wire::{
-    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_SUM, AGG_SNAPSHOT_PROBE_ID,
-    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
+    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
     PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
 };
 
@@ -119,10 +128,10 @@ struct BifrostGuestModule;
 
 // BPF_MAP_TYPE_*, BPF_LD_IMM64, BPF_PSEUDO_MAP_FD moved to bpf_consts.rs.
 
-struct BifrostGuest {
+pub(crate) struct BifrostGuest {
     vdev: *mut bindings::virtio_device,
-    vq_ctrl: *mut bindings::virtqueue,
-    vq_event: *mut bindings::virtqueue,
+    pub(crate) vq_ctrl: *mut bindings::virtqueue,
+    pub(crate) vq_event: *mut bindings::virtqueue,
     /// Phase 4 doorbell virtqueue. The BPF programs kick this
     /// queue (via `bifrost_kfunc_shmem_kick`) after submitting
     /// records to the SHMEM event ringbuf so the host's consumer
@@ -133,24 +142,24 @@ struct BifrostGuest {
     /// the data doesn't matter). Cycled back into the queue after
     /// each ack via a small drain in the kick kfunc.
     doorbell_buf: *mut c_void,
-    ctrl_buf: *mut c_void,
-    event_buf: *mut c_void,
+    pub(crate) ctrl_buf: *mut c_void,
+    pub(crate) event_buf: *mut c_void,
     thread: *mut bindings::task_struct,
     pending_work: u32,
-    cmd_len: u32,
+    pub(crate) cmd_len: u32,
     // BPF program tracking
     prog: *mut bindings::bpf_prog,
     // Map pointers (indexed by map index)
-    maps: [*mut bindings::bpf_map; 8],
-    num_maps: u32,
+    pub(crate) maps: [*mut bindings::bpf_map; 8],
+    pub(crate) num_maps: u32,
     // Kprobe tracking
     kprobe_attached: bool,
     // SHMEM region. Prefer the virtio shared-memory region exposed by
     // the VMM; fall back to the older vmalloc/PFN path for older VMMs.
     shmem_va: *mut u8,
-    shmem_pfns: *mut usize,
-    shmem_n_pages: u64,
-    shmem_from_virtio: bool,
+    pub(crate) shmem_pfns: *mut usize,
+    pub(crate) shmem_n_pages: u64,
+    pub(crate) shmem_from_virtio: bool,
 }
 
 unsafe fn map_bifrost_virtio_shmem(vdev: *mut bindings::virtio_device) -> *mut u8 {
@@ -233,11 +242,11 @@ static mut BIFROST_TRACING_LINK_OPS: bindings::bpf_link_ops = bindings::bpf_link
 /// Per-map fake_fd cache used to dedupe map allocations across LOAD_PROGs:
 /// when a subsequent program declares fake_fd=100 (the shared ringbuf),
 /// the guest finds it here and reuses the existing bpf_map.
-static mut BIFROST_MAP_FAKE_FDS: [i32; 8] = [0; 8];
+pub(crate) static mut BIFROST_MAP_FAKE_FDS: [i32; 8] = [0; 8];
 /// Per-map agg kind, parallel to BIFROST_MAP_FAKE_FDS. Set at
 /// LOAD_PROG time from the MapDef.flags field; consulted by the
 /// snapshot worker to dispatch sum/min/max/avg reduce.
-static mut BIFROST_MAP_AGG_KIND: [u8; 8] = [0; 8];
+pub(crate) static mut BIFROST_MAP_AGG_KIND: [u8; 8] = [0; 8];
 /// Real fds (from `bifrost_map_get_fd`) parallel to BIFROST_MAP_FAKE_FDS,
 /// only populated when LAYER 2 (kernel verifier) is on. The verifier
 /// resolves these fds to bpf_map* during pseudo-ldimm64 fixup. We
@@ -413,193 +422,6 @@ extern "C" {
 
 // RecordWriter moved to drivers/bifrost/record_writer.rs.
 
-/// Pack a snapshot of every non-RINGBUF map's live entries into the
-/// SHMEM event ringbuf. Replaces the legacy VQ_EVENT op=6
-/// AGG_SNAPSHOT virtqueue path.
-///
-/// On-wire body (after the standard 24-byte correlation header
-/// vmid/probe_id=AGG_SNAPSHOT_PROBE_ID/gns/gpid):
-///
-///   [u32 num_entries]
-///   for each entry:
-///     [i32 fake_fd]    (map's fake_fd from LOAD_PROG)
-///     [u32 key_size]   (key length in bytes; 0..=MAX_KEY_BYTES)
-///     [u8 * key_size]  (raw key bytes — multi-key composites
-///                       carry their full byte width here)
-///     [u64 value]
-///
-/// Length-prefixed keys carry full multi-key composites without
-/// the legacy u64-truncation that collapsed `[execname, pid]`
-/// down to just the execname's first 8 bytes.  Worst-case entry
-/// is i32 + u32 + 32 bytes (max 4-key composite at 8 bytes per
-/// chunk) + u64 = 48 bytes; cap 2048 entries → ~99 KB body.
-/// Record max remains 64 KB so we cap entries at a slightly
-/// lower count to stay safely below.
-///
-/// Iterates each map via `bifrost_map_lookup_sum_u64` for
-/// PERCPU_ARRAY/HASH (sums per-cpu) or
-/// `bifrost_map_get_next_key` for HASH-shaped maps.
-unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
-    let _ = bg; // bg held for symmetry; the SHMEM region is module-static.
-    unsafe {
-        // Reserve worst-case sized record up-front.
-        const HDR_BYTES: usize = 24; // correlation header
-        const NUM_ENTRIES_BYTES: usize = 4;
-        // Worst-case per-entry: i32 fd + u32 key_size + 32 byte
-        // key (max 4-key composite at 8 bytes/chunk) + u64 value
-        // = 48 bytes.  Cap MAX_ENTRIES so HDR + n*48 stays under
-        // the 64 KB record max.
-        const MAX_KEY_BYTES: usize = 32;
-        const MAX_ENTRY_BYTES: usize = 4 + 4 + MAX_KEY_BYTES + 8;
-        const MAX_ENTRIES: usize = 1024;
-        const MAX_BODY: usize = HDR_BYTES + NUM_ENTRIES_BYTES + MAX_ENTRIES * MAX_ENTRY_BYTES;
-
-        let rec = bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
-        if rec.is_null() {
-            // Producer full or SHMEM not yet published. Drop this
-            // snapshot — next tick will retry.
-            return;
-        }
-
-        let mut writer = RecordWriter::new(rec, MAX_BODY);
-
-        // Correlation header.
-        writer.write_u32(0); // vmid
-        writer.write_u32(AGG_SNAPSHOT_PROBE_ID);
-        writer.write_u64(bindings::ktime_get_mono_fast_ns());
-        writer.write_u64(0); // gpid
-
-        // num_entries placeholder (overwritten at end).
-        let n_off = writer.off;
-        writer.write_u32(0);
-
-        let mut packed: usize = 0;
-        for i in 0..(*bg).num_maps as usize {
-            if packed >= MAX_ENTRIES {
-                break;
-            }
-            let map = (*bg).maps[i];
-            if map.is_null() {
-                continue;
-            }
-            let fd = BIFROST_MAP_FAKE_FDS[i];
-            let agg_kind = BIFROST_MAP_AGG_KIND[i];
-            let mt = (*map).map_type;
-            // RINGBUF storage is host-mapped — skip it.
-            if mt == BPF_MAP_TYPE_RINGBUF {
-                continue;
-            }
-            // Internal maps (thread-local storage at fake_fd=300+) carry
-            // implementation state, not user-visible aggregations.
-            if fd >= 300 {
-                continue;
-            }
-            let key_size = (*map).key_size as usize;
-
-            // Per-cpu reduce closure: dispatches sum/min/max/avg
-            // based on the agg_kind we stamped at LOAD_PROG time.
-            let reduce = |k_ptr: *const core::ffi::c_void, out: *mut u64| -> i32 {
-                match agg_kind {
-                    AGG_KIND_MIN => bindings::bifrost_map_lookup_min_u64(map, k_ptr, out),
-                    AGG_KIND_MAX => bindings::bifrost_map_lookup_max_u64(map, k_ptr, out),
-                    AGG_KIND_AVG => bindings::bifrost_map_lookup_avg_u64(map, k_ptr, out),
-                    _            => bindings::bifrost_map_lookup_sum_u64(map, k_ptr, out),
-                }
-            };
-
-            if mt == BPF_MAP_TYPE_ARRAY || mt == BPF_MAP_TYPE_PERCPU_ARRAY {
-                let max = (*map).max_entries;
-                for k in 0..max {
-                    if packed >= MAX_ENTRIES {
-                        break;
-                    }
-                    let k32: u32 = k;
-                    let mut v: u64 = 0;
-                    let rc = reduce(
-                        &k32 as *const u32 as *const core::ffi::c_void,
-                        &mut v as *mut u64,
-                    );
-                    if rc != 0 || v == 0 {
-                        continue; // -ENOENT or all-zero across CPUs
-                    }
-                    // ARRAY-shaped maps key on a u32 index.  Length-
-                    // prefixed write: [fd][key_size=4][key bytes][value].
-                    let chk = writer.off;
-                    let k_bytes = k32.to_le_bytes();
-                    if !writer.write_i32(fd)
-                        || !writer.write_u32(4)
-                        || !writer.write_bytes(&k_bytes)
-                        || !writer.write_u64(v)
-                    {
-                        writer.off = chk;
-                        break;
-                    }
-                    packed += 1;
-                }
-            } else {
-                // HASH-shaped: iterate via get_next_key.
-                let mut cur_key = [0u8; 32];
-                let mut next_key = [0u8; 32];
-                let mut have_cur = false;
-                loop {
-                    if packed >= MAX_ENTRIES {
-                        break;
-                    }
-                    let from = if have_cur {
-                        cur_key.as_ptr() as *mut core::ffi::c_void
-                    } else {
-                        core::ptr::null_mut()
-                    };
-                    let rc = bindings::bifrost_map_get_next_key(
-                        map,
-                        from,
-                        next_key.as_mut_ptr() as *mut core::ffi::c_void,
-                    );
-                    if rc != 0 {
-                        break; // -ENOENT = no more keys
-                    }
-                    let mut v: u64 = 0;
-                    let rc_lookup = reduce(
-                        next_key.as_ptr() as *const core::ffi::c_void,
-                        &mut v as *mut u64,
-                    );
-                    if rc_lookup != 0 {
-                        cur_key.copy_from_slice(&next_key);
-                        have_cur = true;
-                        continue;
-                    }
-                    if v != 0 {
-                        // Length-prefixed write: [fd][key_size][key
-                        // bytes][value].  Multi-key composites carry
-                        // their full byte width — no truncation.
-                        let kb = core::cmp::min(key_size, MAX_KEY_BYTES);
-                        let chk = writer.off;
-                        if !writer.write_i32(fd)
-                            || !writer.write_u32(kb as u32)
-                            || !writer.write_bytes(&next_key[..kb])
-                            || !writer.write_u64(v)
-                        {
-                            writer.off = chk;
-                            break;
-                        }
-                        packed += 1;
-                    }
-                    cur_key.copy_from_slice(&next_key);
-                    have_cur = true;
-                }
-            }
-        }
-
-        // Stamp real num_entries.
-        writer.poke_u32(n_off, packed as u32);
-
-        bindings::bifrost_shmem_submit_kernel(rec as *mut c_void);
-    }
-}
-
-// BPF_MAP_TYPE_ARRAY / BPF_MAP_TYPE_PERCPU_ARRAY moved to bpf_consts.rs.
-
-
 /// Stand-in for bpf_get_stack (helper id 67). bpf_base_func_proto in
 /// our libkrunfw build dereferences prog->expected_attach_type for
 /// this case, and our resolver hands it NULL, so the kernel's proto
@@ -646,7 +468,7 @@ unsafe extern "C" fn bifrost_get_stack(
 /// trampoline / __bpf_trace_run paths and never calls this
 /// helper.
 #[inline(always)]
-unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
+pub(crate) unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
     unsafe {
         // Bounds-check against the live slot-table length, not
         // the legacy MAX_KPROBES constant.  After the heap
@@ -675,141 +497,6 @@ unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
     }
 }
 
-// A4 — Per-slot uprobe entry handlers. Signature matches struct
-// uprobe_consumer::handler — pt_regs at the user-mode probe site has
-// the function arguments in x0..x7 (arm64) or rdi/rsi/rdx/rcx/r8/r9
-// (x86_64). The lowered eBPF reads these via the existing pt_regs
-// helpers; nothing in the lowering needs to change.
-/// Shared uprobe entry handler.  Recovers the firing slot via
-/// container-of on the `consumer` argument: `BifrostUprobe::consumer`
-/// is the first field, so the consumer pointer is bit-identical to
-/// the wrapper pointer.  Replaces the retired N hand-rolled
-/// per-slot handler functions; growing MAX_KPROBES is now a single
-/// number bump with no new handler functions, no new match arms.
-unsafe extern "C" fn bifrost_uprobe_handler(
-    self_consumer: *mut bindings::uprobe_consumer,
-    regs: *mut bindings::pt_regs,
-) -> c_int {
-    unsafe {
-        let bp = self_consumer as *const BifrostUprobe;
-        run_prog_slot((*bp).slot as usize, regs);
-    }
-    0
-}
-
-/// Shared uretprobe (return-probe) handler.  The kernel's signature
-/// has an extra `func` argument (entry PC of the probed function);
-/// pt_regs holds the return value in x0/rax which matches DTrace's
-/// `:return` convention.  Same container-of slot-recovery as the
-/// entry handler above.
-unsafe extern "C" fn bifrost_uretprobe_handler(
-    self_consumer: *mut bindings::uprobe_consumer,
-    _func: usize,
-    regs: *mut bindings::pt_regs,
-) -> c_int {
-    unsafe {
-        let bp = self_consumer as *const BifrostUprobe;
-        run_prog_slot((*bp).slot as usize, regs);
-    }
-    0
-}
-
-
-unsafe fn load_prog_seq(cmd: *const BifrostCmd, cmd_len: u32) -> u64 {
-    unsafe {
-        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
-        const SEQ_LEN: usize = core::mem::size_of::<u64>();
-
-        if cmd.is_null() || (cmd_len as usize) < CMD_HDR + SEQ_LEN {
-            return 0;
-        }
-        let cmd_len = cmd_len as usize;
-        let declared_seq_off = CMD_HDR.saturating_add((*cmd).len as usize);
-        let seq_off = if declared_seq_off + SEQ_LEN <= cmd_len {
-            declared_seq_off
-        } else {
-            cmd_len - SEQ_LEN
-        };
-        core::ptr::read_unaligned((cmd as *const u8).add(seq_off) as *const u64)
-    }
-}
-
-unsafe fn send_load_prog_status(bg: *mut BifrostGuest, seq: u64, status: i32) {
-    unsafe {
-        const OP_LOAD_PROG_STATUS: u32 = 9;
-        let event_buf = (*bg).event_buf as *mut u8;
-        core::ptr::copy_nonoverlapping(
-            &OP_LOAD_PROG_STATUS as *const u32 as *const u8,
-            event_buf,
-            4,
-        );
-        core::ptr::copy_nonoverlapping(
-            &seq as *const u64 as *const u8,
-            event_buf.add(4),
-            8,
-        );
-        core::ptr::copy_nonoverlapping(
-            &status as *const i32 as *const u8,
-            event_buf.add(12),
-            4,
-        );
-
-        let mut sg: bindings::scatterlist = core::mem::zeroed();
-        bindings::sg_init_one(&mut sg, (*bg).event_buf, 16);
-        let add_err = bindings::virtqueue_add_outbuf(
-            (*bg).vq_event,
-            &mut sg,
-            1,
-            (*bg).event_buf,
-            bindings::GFP_KERNEL,
-        );
-        if add_err != 0 {
-            pr_err!("bifrost_guest: LOAD_PROG status event add failed: {}\n", add_err);
-            return;
-        }
-        bindings::virtqueue_kick((*bg).vq_event);
-
-        let mut consumed_len: core::ffi::c_uint = 0;
-        let mut spins: u32 = 0;
-        loop {
-            let ret = bindings::virtqueue_get_buf((*bg).vq_event, &mut consumed_len);
-            if !ret.is_null() {
-                break;
-            }
-            core::hint::spin_loop();
-            spins += 1;
-            if spins % 1024 == 0 {
-                bindings::__cond_resched();
-            }
-        }
-    }
-}
-
-unsafe fn repost_ctrl_buffer(bg: *mut BifrostGuest) {
-    unsafe {
-        let mut sg_in: bindings::scatterlist = core::mem::zeroed();
-        bindings::sg_init_one(&mut sg_in, (*bg).ctrl_buf, 65536);
-        bindings::virtqueue_add_inbuf(
-            (*bg).vq_ctrl,
-            &mut sg_in,
-            1,
-            (*bg).ctrl_buf,
-            bindings::GFP_KERNEL,
-        );
-        bindings::virtqueue_kick((*bg).vq_ctrl);
-    }
-}
-
-unsafe fn complete_load_prog(bg: *mut BifrostGuest, cmd: *const BifrostCmd, status: i32) {
-    unsafe {
-        if !cmd.is_null() && (*cmd).op == 2 {
-            let seq = load_prog_seq(cmd, (*bg).cmd_len);
-            send_load_prog_status(bg, seq, status);
-        }
-        repost_ctrl_buffer(bg);
-    }
-}
-
 unsafe fn free_slot_prog(slot: usize) {
     unsafe {
         if slot >= slots_mut().len() {
@@ -821,105 +508,6 @@ unsafe fn free_slot_prog(slot: usize) {
         }
     }
 }
-
-/// One-shot SHMEM_INIT message to the host. For the generic virtio
-/// SHM path this is a 24-byte readiness notification (`n_pages=0`);
-/// the host already owns the region and maps it through the VMM's
-/// virtio-shm metadata. For older VMMs, the fallback carries the
-/// per-page PFN array so libkrun can derive host VAs from guest RAM.
-///
-/// Wire format:
-///   [u32 op=8][u32 region_size][u32 n_pages][u32 magic]
-///   [u32 version][u32 reserved]
-///   [u64 pfns × n_pages]
-///
-/// Total: 24 bytes for virtio SHM, or 24 + n_pages × 8 for PFN SHM.
-/// The fallback remains 32 792 bytes for a 16 MB region.
-unsafe fn send_shmem_init(bg: *mut BifrostGuest) {
-    unsafe {
-        const OP_SHMEM_INIT: u32 = 8;
-        let event_buf = (*bg).event_buf as *mut u8;
-        let region_size = SHMEM_REGION_SIZE as u32;
-        let n_pages = (*bg).shmem_n_pages as u32;
-
-        // Header.
-        core::ptr::copy_nonoverlapping(
-            &OP_SHMEM_INIT as *const u32 as *const u8,
-            event_buf,
-            4,
-        );
-        core::ptr::copy_nonoverlapping(
-            &region_size as *const u32 as *const u8,
-            event_buf.add(4),
-            4,
-        );
-        core::ptr::copy_nonoverlapping(
-            &n_pages as *const u32 as *const u8,
-            event_buf.add(8),
-            4,
-        );
-        core::ptr::copy_nonoverlapping(
-            &SHMEM_MAGIC as *const u32 as *const u8,
-            event_buf.add(12),
-            4,
-        );
-        core::ptr::copy_nonoverlapping(
-            &SHMEM_VERSION as *const u32 as *const u8,
-            event_buf.add(16),
-            4,
-        );
-        let reserved: u32 = if (*bg).shmem_from_virtio { 1 } else { 0 };
-        core::ptr::copy_nonoverlapping(
-            &reserved as *const u32 as *const u8,
-            event_buf.add(20),
-            4,
-        );
-
-        if n_pages != 0 {
-            // PFN array — usize on the kernel side, marshalled as u64.
-            // arm64 kernel is 64-bit so usize == u64; cast is a no-op
-            // but the explicit type keeps the wire format CPU-agnostic.
-            let pfns_dst = event_buf.add(24) as *mut u64;
-            for i in 0..(n_pages as usize) {
-                *pfns_dst.add(i) = *((*bg).shmem_pfns).add(i) as u64;
-            }
-        }
-
-        let total_len = 24 + (n_pages as usize) * 8;
-        let mut sg: bindings::scatterlist = core::mem::zeroed();
-        bindings::sg_init_one(&mut sg, (*bg).event_buf, total_len as u32);
-        bindings::virtqueue_add_outbuf(
-            (*bg).vq_event,
-            &mut sg,
-            1,
-            (*bg).event_buf,
-            bindings::GFP_KERNEL,
-        );
-        bindings::virtqueue_kick((*bg).vq_event);
-
-        // Spin for ack (host returns the buffer once it has mapped
-        // and validated the region). Same yield pattern as
-        // send_vmlinux_btf so RCU stalls don't trip on slow hosts.
-        let mut consumed_len: core::ffi::c_uint = 0;
-        let mut spins: u32 = 0;
-        loop {
-            let ret = bindings::virtqueue_get_buf((*bg).vq_event, &mut consumed_len);
-            if !ret.is_null() {
-                break;
-            }
-            core::hint::spin_loop();
-            spins += 1;
-            if spins % 1024 == 0 {
-                bindings::__cond_resched();
-            }
-        }
-        pr_info!(
-            "bifrost_guest: SHMEM_INIT sent ({} bytes, {} pfns, virtio_shm={}) and acked\n",
-            total_len, n_pages, (*bg).shmem_from_virtio
-        );
-    }
-}
-
 
 extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
     unsafe {
