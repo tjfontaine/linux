@@ -11,20 +11,22 @@ use kernel::bindings;
 
 unsafe extern "C" {
     /// C helper (drivers/bifrost/bifrost_helpers.c) — wraps
-    /// for_each_process under rcu_read_lock.  Returns NULL on no
-    /// match.  See the helper file for the locking contract.
+    /// for_each_process under rcu_read_lock. Returns NULL on no
+    /// match, otherwise returns a refcounted task that must be
+    /// released with `bifrost_helper_put_task_struct`.
     fn bifrost_helper_find_task_by_comm(
         target: *const u8,
         target_len: u32,
     ) -> *mut bindings::task_struct;
+
+    /// Drop the task reference returned by
+    /// `bifrost_helper_find_task_by_comm`.
+    fn bifrost_helper_put_task_struct(task: *mut bindings::task_struct);
 }
 
 /// Walk `for_each_process` looking for a task whose `comm` matches the
-/// given basename.  Returns the first match (RCU-protected pointer; the
-/// caller must hold rcu_read_lock or otherwise guarantee the task is
-/// not freed while it dereferences the pointer — typically by using
-/// `get_task_exe_file` immediately, which bumps a refcount on its
-/// internal state).
+/// given basename. Returns the first match with a task ref held; the
+/// caller must release it with `put_task_ref`.
 ///
 /// This is the container-aware uprobe-target resolver: comm is the
 /// kernel's own truncated-at-15-bytes name for the running task, set
@@ -34,14 +36,23 @@ unsafe extern "C" {
 /// kernel mapped — bypassing the need for kern_path's namespace-bound
 /// lookup entirely.
 ///
-/// SAFETY: the caller must use the returned pointer under rcu_read_lock
-/// or call `get_task_exe_file` immediately to elevate the reference
-/// before any other use.
+/// SAFETY: the returned pointer is a kernel task pointer. It remains
+/// valid until the caller passes it to `put_task_ref`.
 pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_struct {
     if target.is_empty() {
         return core::ptr::null_mut();
     }
     unsafe {
         bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32)
+    }
+}
+
+/// Release a task reference returned by `find_task_by_comm`.
+pub(crate) unsafe fn put_task_ref(task: *mut bindings::task_struct) {
+    if task.is_null() {
+        return;
+    }
+    unsafe {
+        bifrost_helper_put_task_struct(task);
     }
 }

@@ -2480,6 +2480,14 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
 }
 EXPORT_SYMBOL_GPL(bifrost_set_shmem_ringbuf);
 
+void bifrost_clear_shmem_ringbuf(void)
+{
+	WRITE_ONCE(bifrost_shmem_va, NULL);
+	smp_wmb();
+	WRITE_ONCE(bifrost_shmem_len, 0);
+}
+EXPORT_SYMBOL_GPL(bifrost_clear_shmem_ringbuf);
+
 /*
  * Pack the firing task's file-backed VMA table into @buf for the
  * gustack symbolicator on the host. Each entry describes one VMA's
@@ -3985,6 +3993,14 @@ int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(bifrost_set_doorbell_callback);
+
+void bifrost_clear_doorbell_callback(void)
+{
+	WRITE_ONCE(bifrost_kick_fn, NULL);
+	smp_wmb();
+	WRITE_ONCE(bifrost_kick_priv, NULL);
+}
+EXPORT_SYMBOL_GPL(bifrost_clear_doorbell_callback);
 
 __bpf_kfunc void bifrost_kfunc_shmem_kick(void)
 {

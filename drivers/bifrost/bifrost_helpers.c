@@ -22,19 +22,15 @@
 
 /*
  * Walk the task list looking for the first task whose `comm` matches
- * the given basename.  Returns the matching task_struct *, or NULL.
- * Caller must NOT dereference the returned task pointer outside of an
- * RCU read-side critical section unless they pin it themselves
- * (typically via get_task_exe_file, which task_locks internally).
+ * the given basename.  Returns the matching task_struct * with a task
+ * reference held, or NULL.  Caller must release a non-NULL result with
+ * bifrost_helper_put_task_struct().
  *
  * `target` may be up to TASK_COMM_LEN-1 (15) bytes — longer prefixes
  * are truncated to match the kernel's own comm storage.
  *
- * The walk runs under rcu_read_lock; the result pointer is briefly
- * valid after rcu_read_unlock thanks to the RCU grace-period
- * guarantee, but the caller is expected to immediately call a
- * task-pinning helper (get_task_exe_file et al.) that elevates the
- * reference count before doing anything else with the pointer.
+ * The get_task_struct() happens before rcu_read_unlock(), so no raw
+ * unpinned task pointer crosses the C/Rust boundary.
  */
 struct task_struct *bifrost_helper_find_task_by_comm(
 	const unsigned char *target,
@@ -68,6 +64,7 @@ struct task_struct *bifrost_helper_find_task_by_comm(
 		if (eq && (n == 15 || comm[n] == '\0' ||
 			   comm[n] == ' ' || comm[n] == ':')) {
 			result = p;
+			get_task_struct(result);
 			break;
 		}
 	}
@@ -98,6 +95,13 @@ struct task_struct *bifrost_helper_find_task_by_comm(
 	return result;
 }
 EXPORT_SYMBOL_GPL(bifrost_helper_find_task_by_comm);
+
+void bifrost_helper_put_task_struct(struct task_struct *task)
+{
+	if (task)
+		put_task_struct(task);
+}
+EXPORT_SYMBOL_GPL(bifrost_helper_put_task_struct);
 
 /*
  * Read `count` bytes from `file` at `pos` into `buf`.  Thin wrapper
@@ -1061,9 +1065,10 @@ EXPORT_SYMBOL_GPL(bifrost_helper_emit_symtab_for_file);
  *     things it'd actually walk in a backtrace)
  *   - already seen via the dedup table
  *
- * Locking: takes mmap_read_lock (NOT trylock — caller is expected
- * to be in a sleepable context, e.g. the bifrost worker thread or
- * the uprobe register path, not BPF/kprobe).
+ * Locking: takes mmap_read_lock only long enough to collect and
+ * get_file() a bounded list.  The callback runs after unlocking, so
+ * ELF reads, d_path(), and SHMEM publication do not happen under the
+ * mm lock.
  */
 #define BIFROST_VMA_FILE_MAX 32
 typedef void (*bifrost_vma_file_cb_t)(struct file *file, void *ctx);
@@ -1074,6 +1079,9 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
 {
 	struct mm_struct *mm;
 	struct vm_area_struct *vma;
+	struct file *seen[BIFROST_VMA_FILE_MAX];
+	unsigned int n_seen = 0;
+	unsigned int i;
 
 	if (!task || !cb)
 		return;
@@ -1086,20 +1094,10 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
 
 	mmap_read_lock(mm);
 	{
-		/* `seen` / `n_seen` / `i` are kept in this inner scope
-		 * deliberately — declared at function top, gcc 16
-		 * + the kernel's -Werror=unused-variable spuriously
-		 * fires (the for_each_vma macro expansion creates an
-		 * intermediate scope the analysis can't see through).
-		 * Keeping the dedup state co-located with the loop
-		 * also reads better. */
-		struct file *seen[BIFROST_VMA_FILE_MAX];
-		unsigned int n_seen = 0;
 		VMA_ITERATOR(vmi, mm, 0);
 		for_each_vma(vmi, vma) {
 			struct file *f;
 			bool dup = false;
-			unsigned int i;
 
 			if (n_seen >= BIFROST_VMA_FILE_MAX)
 				break;
@@ -1116,18 +1114,16 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
 			}
 			if (dup)
 				continue;
+			get_file(f);
 			seen[n_seen++] = f;
-			/* The cb is invoked while we still hold
-			 * mmap_read_lock; the file pointer is therefore
-			 * pinned for the duration of the call (the VMA
-			 * holds an implicit ref on vm_file).  The Rust
-			 * callback reads from the file via kernel_read
-			 * (sleepable) which is fine under
-			 * mmap_read_lock — we're not in atomic context. */
-			cb(f, ctx);
 		}
 	}
 	mmap_read_unlock(mm);
+
+	for (i = 0; i < n_seen; i++) {
+		cb(seen[i], ctx);
+		fput(seen[i]);
+	}
 	mmput(mm);
 }
 EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
@@ -1171,6 +1167,10 @@ static const struct bifrost_kfunc_decl BIFROST_KFUNC_MANIFEST[] = {
 	{
 		"bifrost_helper_find_task_by_comm",
 		"struct task_struct *(const unsigned char *, unsigned int)",
+	},
+	{
+		"bifrost_helper_put_task_struct",
+		"void (struct task_struct *)",
 	},
 	{
 		"bifrost_helper_resolve_symbol",
