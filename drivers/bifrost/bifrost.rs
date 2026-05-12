@@ -1606,13 +1606,13 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
             // RINGBUF_RECORDS) is gone — kept as #[allow(dead_code)]
             // scaffolding pending the agg-path SHMEM port.
 
-            if core::ptr::read_volatile(&(*bg).pending_work) != 0 {
-                core::ptr::write_volatile(&mut (*bg).pending_work, 0);
+	            if core::ptr::read_volatile(&(*bg).pending_work) != 0 {
+	                core::ptr::write_volatile(&mut (*bg).pending_work, 0);
 
-                let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
-                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
-                    let mut load_status: i32 = 0;
-                    if (*cmd).op == 2 { // LOAD_PROG
+	                let cmd = (*bg).ctrl_buf as *mut BifrostCmd;
+	                let mut load_status: i32 = 0;
+	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
+	                    if (*cmd).op == 2 { // LOAD_PROG
                         pr_info!("bifrost_guest: processing LOAD_PROG command\n");
                         let parse_status = validate_load_prog_cmd(cmd, (*bg).cmd_len);
                         if parse_status != 0 {
