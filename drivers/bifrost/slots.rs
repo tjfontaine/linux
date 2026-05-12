@@ -6,7 +6,7 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use kernel::bindings;
 use kernel::prelude::*;
 
-use crate::wire::{PROBE_TYPE_NONE, MAX_PROBE_SLOTS};
+use crate::wire::{MAX_PROBE_SLOTS, PROBE_TYPE_NONE};
 
 /// Initial slot-table capacity allocated at module init.
 ///
@@ -104,8 +104,7 @@ pub(crate) fn bifrost_slots_init() -> Result<()> {
         if BIFROST_SLOTS_OPT.is_some() {
             return Ok(());
         }
-        let mut v: KVec<KBox<BifrostSlot>> =
-            KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
+        let mut v: KVec<KBox<BifrostSlot>> = KVec::with_capacity(INITIAL_SLOT_HINT, GFP_KERNEL)?;
         for _ in 0..INITIAL_SLOT_HINT {
             let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
             v.push(b, GFP_KERNEL)?;
@@ -135,12 +134,7 @@ pub(crate) unsafe fn slots_ensure(n: usize) -> Result<()> {
 /// SAFETY: caller must ensure `bifrost_slots_init()` has run.
 #[inline]
 pub(crate) unsafe fn slots_mut() -> &'static mut [KBox<BifrostSlot>] {
-    unsafe {
-        BIFROST_SLOTS_OPT
-            .as_mut()
-            .unwrap_unchecked()
-            .as_mut_slice()
-    }
+    unsafe { BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked().as_mut_slice() }
 }
 
 /// Allocate a fresh non-zero slot lease.

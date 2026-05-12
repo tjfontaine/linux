@@ -42,9 +42,7 @@ pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_str
     if target.is_empty() {
         return core::ptr::null_mut();
     }
-    unsafe {
-        bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32)
-    }
+    unsafe { bifrost_helper_find_task_by_comm(target.as_ptr(), target.len() as u32) }
 }
 
 /// Release a task reference returned by `find_task_by_comm`.

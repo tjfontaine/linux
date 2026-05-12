@@ -78,11 +78,7 @@ impl RecordWriter {
             return false;
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                src.as_ptr(),
-                self.base.add(self.off),
-                src.len(),
-            );
+            core::ptr::copy_nonoverlapping(src.as_ptr(), self.base.add(self.off), src.len());
         }
         self.off += src.len();
         true
@@ -95,11 +91,7 @@ impl RecordWriter {
             return false;
         }
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                &val as *const u32 as *const u8,
-                self.base.add(off),
-                4,
-            );
+            core::ptr::copy_nonoverlapping(&val as *const u32 as *const u8, self.base.add(off), 4);
         }
         true
     }

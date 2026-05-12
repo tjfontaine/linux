@@ -41,7 +41,8 @@ pub(crate) unsafe fn populate_shmem_btf(shmem_va: *mut u8) -> usize {
         if size > SHMEM_BTF_CAP {
             pr_err!(
                 "bifrost_guest: vmlinux BTF too large ({} > {} cap)\n",
-                size, SHMEM_BTF_CAP
+                size,
+                SHMEM_BTF_CAP
             );
             return 0;
         }
@@ -49,7 +50,8 @@ pub(crate) unsafe fn populate_shmem_btf(shmem_va: *mut u8) -> usize {
         core::ptr::copy_nonoverlapping(btf_start, dst, size);
         pr_info!(
             "bifrost_guest: BTF placed at SHMEM offset {} ({} bytes)\n",
-            SHMEM_BTF_OFF, size
+            SHMEM_BTF_OFF,
+            size
         );
         size
     }
@@ -78,12 +80,14 @@ pub(crate) unsafe fn populate_shmem_kallsyms(shmem_va: *mut u8) -> usize {
         if acc.overflow {
             pr_err!(
                 "bifrost_guest: kallsyms truncated at {} bytes ({} cap)\n",
-                acc.pos, SHMEM_KSYMS_CAP
+                acc.pos,
+                SHMEM_KSYMS_CAP
             );
         }
         pr_info!(
             "bifrost_guest: kallsyms placed at SHMEM offset {} ({} bytes)\n",
-            SHMEM_KSYMS_OFF, acc.pos
+            SHMEM_KSYMS_OFF,
+            acc.pos
         );
         acc.pos
     }
@@ -96,11 +100,7 @@ struct ShmemKsymsAccum {
     overflow: bool,
 }
 
-unsafe extern "C" fn shmem_ksyms_cb(
-    data: *mut c_void,
-    name: *const c_char,
-    addr: usize,
-) -> c_int {
+unsafe extern "C" fn shmem_ksyms_cb(data: *mut c_void, name: *const c_char, addr: usize) -> c_int {
     unsafe {
         let acc = data as *mut ShmemKsymsAccum;
         if (*acc).overflow || name.is_null() {

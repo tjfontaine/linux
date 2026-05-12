@@ -8,8 +8,8 @@ use kernel::prelude::*;
 use crate::bpf_consts::{BPF_LD_IMM64, BPF_PSEUDO_MAP_FD};
 use crate::types::{BifrostCmd, BpfInsn, MapDef};
 use crate::wire::{
-    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
-    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
+    PROBE_TYPE_USDT,
 };
 
 pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
@@ -121,7 +121,10 @@ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32
         }
 
         if num_maps > 8 {
-            pr_err!("bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n", num_maps);
+            pr_err!(
+                "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n",
+                num_maps
+            );
             return -(bindings::EINVAL as i32);
         }
         let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
