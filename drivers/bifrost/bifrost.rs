@@ -1150,13 +1150,19 @@ unsafe extern "C" fn bifrost_uretprobe_handler(
 
 unsafe fn load_prog_seq(cmd: *const BifrostCmd, cmd_len: u32) -> u64 {
     unsafe {
-        if cmd.is_null() || (cmd_len as usize) < core::mem::size_of::<BifrostCmd>() {
+        const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
+        const SEQ_LEN: usize = core::mem::size_of::<u64>();
+
+        if cmd.is_null() || (cmd_len as usize) < CMD_HDR + SEQ_LEN {
             return 0;
         }
-        let seq_off = core::mem::size_of::<BifrostCmd>() + (*cmd).len as usize;
-        if (cmd_len as usize) < seq_off + core::mem::size_of::<u64>() {
-            return 0;
-        }
+        let cmd_len = cmd_len as usize;
+        let declared_seq_off = CMD_HDR.saturating_add((*cmd).len as usize);
+        let seq_off = if declared_seq_off + SEQ_LEN <= cmd_len {
+            declared_seq_off
+        } else {
+            cmd_len - SEQ_LEN
+        };
         core::ptr::read_unaligned((cmd as *const u8).add(seq_off) as *const u64)
     }
 }
