@@ -1140,9 +1140,9 @@ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
  * UB at runtime.  The manifest makes the contract explicit:
  *
  *   1. This file lists every kfunc + its canonical signature string.
- *   2. drivers/bifrost/bifrost.rs lists the same names + the same
- *      signature strings (as bytes) in the BIFROST_KFUNC_EXPECTED
- *      array.
+	 *   2. drivers/bifrost/kfunc_manifest.rs lists the same names +
+	 *      the same signature strings (as bytes) in the
+	 *      BIFROST_KFUNC_EXPECTED array.
  *   3. bifrost_kfunc_manifest_hash() returns a djb2 hash of the
  *      concatenated (name, sig) pairs.  At module init the Rust
  *      side computes the same hash from BIFROST_KFUNC_EXPECTED;
@@ -1151,8 +1151,8 @@ EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
  *      build time so the runtime check never fires in a clean tree.
  *
  * Adding a new kfunc: append to BIFROST_KFUNC_MANIFEST here AND to
- * BIFROST_KFUNC_EXPECTED in bifrost.rs.  Order matters — both
- * sides hash in array order.
+	 * BIFROST_KFUNC_EXPECTED in kfunc_manifest.rs.  Order matters —
+	 * both sides hash in array order.
  *
  * Changing a signature: update the sig string in both places.  The
  * djb2 will change; module init will refuse to load until both
