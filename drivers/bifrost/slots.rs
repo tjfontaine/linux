@@ -8,17 +8,25 @@ use kernel::prelude::*;
 
 use crate::wire::{MAX_PROBE_SLOTS, PROBE_TYPE_NONE};
 
-/// Initial slot-table capacity allocated at module init.
+/// Slot-table capacity allocated at module init.
 ///
-/// **Phase C completion**: the slot table is now a
-/// `KVec<KBox<BifrostSlot>>` that grows on demand; there is no hard
-/// cap.  The driver pre-allocates `INITIAL_SLOT_HINT` slots to avoid
-/// kmalloc churn for typical workloads.
-pub(crate) const INITIAL_SLOT_HINT: usize = 8;
+/// **Phase L (goal item 4)**: the slot table is now allocated full at
+/// init time rather than growing on demand.  `KVec<KBox<BifrostSlot>>`
+/// remains the underlying storage, but `KVec::push` is no longer
+/// called past `bifrost_slots_init()`.  This closes the IRQ-vs-worker
+/// race where the spine could be reallocated on one CPU while an
+/// already-attached uprobe was firing `slots_mut()[K]` on another.
+///
+/// Sizing rationale: `MAX_PROBE_SLOTS = 256`, `sizeof(BifrostSlot)`
+/// is small (~200 bytes after padding), so the full table is well
+/// under 64 KB pre-allocated at module load.  Slots past the cap
+/// are refused with `-ENOSPC` (was: silent grow then later silent
+/// truncation through a separate cap check).
+pub(crate) const INITIAL_SLOT_HINT: usize = MAX_PROBE_SLOTS;
 
-/// Compatibility soft cap referenced by the host CLI's preflight check.
-/// The driver does not enforce this; `slots_ensure` grows past it on
-/// demand.
+/// Hard cap on concurrently-attached probe slots.  Pre-allocated at
+/// init; `slots_ensure` refuses past this point.  Matches the host
+/// CLI's preflight check.
 pub(crate) const MAX_KPROBES: usize = MAX_PROBE_SLOTS;
 
 /// Per-slot uprobe consumer wrapper.  Container-of slot recovery:
@@ -114,14 +122,17 @@ pub(crate) fn bifrost_slots_init() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the slot table has at least `n` slots, allocating new
-/// `KBox<BifrostSlot>` entries as needed.
+/// Ensure the slot table has at least `n` slots.  Post-init the table
+/// is fixed-size at `INITIAL_SLOT_HINT == MAX_PROBE_SLOTS`; this is a
+/// pure bounds check that returns `-ENOSPC` when the request exceeds
+/// the pre-allocated capacity.  The spine is never reallocated past
+/// init, so callers in IRQ context (uprobe handlers) cannot observe
+/// torn slice headers.
 pub(crate) unsafe fn slots_ensure(n: usize) -> Result<()> {
     unsafe {
         let v = BIFROST_SLOTS_OPT.as_mut().unwrap_unchecked();
-        while v.len() < n {
-            let b = KBox::new(BifrostSlot::new(), GFP_KERNEL)?;
-            v.push(b, GFP_KERNEL)?;
+        if n > v.len() {
+            return Err(Error::from_errno(-(kernel::bindings::ENOSPC as i32)));
         }
         Ok(())
     }

@@ -37,7 +37,8 @@ unsafe extern "C" {
 /// lookup entirely.
 ///
 /// SAFETY: the returned pointer is a kernel task pointer. It remains
-/// valid until the caller passes it to `put_task_ref`.
+/// valid until the caller passes it to `put_task_ref` (or until a
+/// containing `TaskRef` is dropped).
 pub(crate) unsafe fn find_task_by_comm(target: &[u8]) -> *mut bindings::task_struct {
     if target.is_empty() {
         return core::ptr::null_mut();
@@ -52,5 +53,46 @@ pub(crate) unsafe fn put_task_ref(task: *mut bindings::task_struct) {
     }
     unsafe {
         bifrost_helper_put_task_struct(task);
+    }
+}
+
+/// RAII wrapper for a refcounted `task_struct *` obtained via
+/// `bifrost_helper_find_task_by_comm`. Goal item 6: pairs the
+/// `get_task_struct` inside the C helper with a mechanical
+/// `put_task_struct` on drop so no early-return or `?`-propagation
+/// can leak a task reference. Use `TaskRef::find` to construct;
+/// dereference via `as_ptr()` for FFI calls.
+pub(crate) struct TaskRef {
+    ptr: *mut bindings::task_struct,
+}
+
+impl TaskRef {
+    /// Look up the first task whose `comm` matches `target`. Returns
+    /// `None` if no task matches; the caller must not dereference
+    /// past the returned `TaskRef`'s lifetime.
+    pub(crate) fn find(target: &[u8]) -> Option<Self> {
+        // SAFETY: the C helper takes a const buffer + len and walks
+        // for_each_process under rcu_read_lock; we don't dereference
+        // the returned pointer ourselves here.
+        let ptr = unsafe { find_task_by_comm(target) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(TaskRef { ptr })
+        }
+    }
+
+    /// Raw task pointer.  Valid for the lifetime of this `TaskRef`.
+    pub(crate) fn as_ptr(&self) -> *mut bindings::task_struct {
+        self.ptr
+    }
+}
+
+impl Drop for TaskRef {
+    fn drop(&mut self) {
+        // SAFETY: ptr was returned by `find_task_by_comm` with a
+        // pinned task ref. `put_task_ref` is a no-op on NULL.
+        unsafe { put_task_ref(self.ptr) };
+        self.ptr = core::ptr::null_mut();
     }
 }

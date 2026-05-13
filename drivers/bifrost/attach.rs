@@ -10,7 +10,7 @@ use kernel::prelude::*;
 use crate::path_helpers::path_basename;
 use crate::slots::{slot_lease_new, slots_ensure, slots_mut, BIFROST_NUM_KPROBES};
 use crate::symtab_snapshot::push_symtab_snapshot_cb;
-use crate::task_helpers::{find_task_by_comm, put_task_ref};
+use crate::task_helpers::TaskRef;
 use crate::uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
 use crate::wire::{
     PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
@@ -418,22 +418,24 @@ unsafe fn attach_slot_uprobe_by_sym(
             );
             return -(bindings::EINVAL as i32);
         }
-        let task = find_task_by_comm(basename);
-        if task.is_null() {
+        // Goal item 6: TaskRef pairs the C-side get_task_struct with a
+        // mechanical put_task_struct on drop. Replaces the manual
+        // put_task_ref calls that were scattered across each early
+        // return.
+        let Some(task) = TaskRef::find(basename) else {
             pr_err!(
                 "bifrost_guest: uprobe-by-sym slot[{}] no task with comm '{}'\n",
                 slot,
                 core::str::from_utf8(basename).unwrap_or("?")
             );
             return -(bindings::ENOENT as i32);
-        }
-        let exe = get_task_exe_file(task);
+        };
+        let exe = get_task_exe_file(task.as_ptr());
         if exe.is_null() {
             pr_err!(
                 "bifrost_guest: uprobe-by-sym slot[{}] task has no exe_file\n",
                 slot
             );
-            put_task_ref(task);
             return -(bindings::ENOENT as i32);
         }
         let mut sym_off: u64 = 0;
@@ -453,7 +455,6 @@ unsafe fn attach_slot_uprobe_by_sym(
                 rc
             );
             fput(exe);
-            put_task_ref(task);
             return rc;
         }
         pr_info!(
@@ -473,11 +474,11 @@ unsafe fn attach_slot_uprobe_by_sym(
         // into the same task, so the bottom frames of gustack
         // symbolicate too.
         bifrost_helper_for_each_vma_file(
-            task,
+            task.as_ptr(),
             Some(push_symtab_snapshot_cb),
             core::ptr::null_mut(),
         );
-        put_task_ref(task);
+        drop(task);
         let exe_inode = (*exe).f_inode;
         let pinned = igrab(exe_inode);
         fput(exe);
@@ -649,21 +650,21 @@ unsafe fn attach_slot_usdt(
                 );
                 return -(bindings::ENOENT as i32);
             }
-            (core::ptr::null_mut(), pinned)
+            (None, pinned)
         } else {
-            let task = find_task_by_comm(basename);
-            if task.is_null() {
+            // Goal item 6: TaskRef RAII pairs get_task_struct on the C
+            // side with put_task_struct on drop.
+            let Some(task_ref) = TaskRef::find(basename) else {
                 pr_err!(
                     "bifrost_guest: usdt slot[{}] no task with comm '{}'\n",
                     slot,
                     core::str::from_utf8(basename).unwrap_or("?")
                 );
                 return -(bindings::ENOENT as i32);
-            }
-            let exe = get_task_exe_file(task);
+            };
+            let exe = get_task_exe_file(task_ref.as_ptr());
             if exe.is_null() {
                 pr_err!("bifrost_guest: usdt slot[{}] task has no exe_file\n", slot);
-                put_task_ref(task);
                 return -(bindings::ENOENT as i32);
             }
             let rc = bifrost_helper_resolve_usdt(
@@ -684,13 +685,12 @@ unsafe fn attach_slot_usdt(
                     rc
                 );
                 fput(exe);
-                put_task_ref(task);
                 return rc;
             }
             let exe_inode = (*exe).f_inode;
             let pinned = igrab(exe_inode);
             fput(exe);
-            (task, pinned)
+            (Some(task_ref), pinned)
         };
         pr_info!(
             "bifrost_guest: usdt slot[{}] resolved {}:{} pc=+0x{:x} sema=+0x{:x}\n",
@@ -702,14 +702,14 @@ unsafe fn attach_slot_usdt(
         );
         // Push symtabs for the firing task's executable VMAs (same as the
         // by-sym path) so any gustack() in the body symbolicates cleanly.
-        if !task.is_null() {
+        if let Some(task) = task.as_ref() {
             bifrost_helper_for_each_vma_file(
-                task,
+                task.as_ptr(),
                 Some(push_symtab_snapshot_cb),
                 core::ptr::null_mut(),
             );
-            put_task_ref(task);
         }
+        // task: Option<TaskRef> drops here at end of block.
         if pinned.is_null() {
             pr_err!("bifrost_guest: usdt slot[{}] igrab returned NULL\n", slot);
             return -(bindings::ENOENT as i32);
@@ -808,22 +808,25 @@ unsafe fn attach_slot_uprobe(
         let mut resolved_via = "<unset>";
 
         // Stage 1: exe_file via for_each_process.
+        // Goal item 6: TaskRef releases the task ref on drop, even
+        // through the early-break branches inside the chain below.
         let basename = path_basename(uprobe_path_buf);
-        if !basename.is_empty() {
-            let task = find_task_by_comm(basename);
-            if !task.is_null() {
-                let exe = get_task_exe_file(task);
-                put_task_ref(task);
-                if !exe.is_null() {
-                    let exe_inode = (*exe).f_inode;
-                    pinned = igrab(exe_inode);
-                    // Drop the file ref — the inode pin (igrab
-                    // refcount) is sufficient to keep the inode
-                    // alive for the lifetime of the uprobe.
-                    fput(exe);
-                    if !pinned.is_null() {
-                        resolved_via = "exe_file";
-                    }
+        if !basename.is_empty()
+            && let Some(task) = TaskRef::find(basename)
+        {
+            let exe = get_task_exe_file(task.as_ptr());
+            // Drop the task ref before fput on exe — neither
+            // depends on the other after exe_file is captured.
+            drop(task);
+            if !exe.is_null() {
+                let exe_inode = (*exe).f_inode;
+                pinned = igrab(exe_inode);
+                // Drop the file ref — the inode pin (igrab refcount)
+                // is sufficient to keep the inode alive for the
+                // lifetime of the uprobe.
+                fput(exe);
+                if !pinned.is_null() {
+                    resolved_via = "exe_file";
                 }
             }
         }
