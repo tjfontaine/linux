@@ -23,8 +23,31 @@ pub(crate) const SHMEM_N_PAGES: usize = SHMEM_REGION_SIZE / 4096;
 /// the same memory. ASCII 'BFSH' interpreted as little-endian.
 pub(crate) const SHMEM_MAGIC: u32 = 0x48534642;
 /// Layout version stored next to the magic. Bumped whenever the
-/// header layout changes incompatibly.
-pub(crate) const SHMEM_VERSION: u32 = 3;
+/// header layout changes incompatibly. V4: per-CPU principal
+/// buffer carve (W1). The 6 MB `SHMEM_RINGBUF_LEN` is divided
+/// equally across `BIFROST_NUM_CPUS_MAX` sub-rings; the host
+/// reads `num_cpus` / `per_cpu_ring_len` from the in-region
+/// header so it always sees the actual chosen carve.
+pub(crate) const SHMEM_VERSION: u32 = 4;
+
+/// Cap on per-CPU sub-rings. Hosts with more CPUs share a
+/// sub-ring (modulo `num_cpus` selection at reserve time);
+/// hosts with fewer leave the upper sub-rings unused. Mirrors
+/// the `BIFROST_NUM_CPUS_MAX` define in
+/// `kernel/bpf/helpers.c`. The host-side mirror lives in
+/// `host/bifrost-wire/src/lib.rs` as `SHMEM_NUM_CPUS_MAX` for
+/// the cross-layer drift script.
+pub(crate) const SHMEM_NUM_CPUS_MAX: u32 = 16;
+
+/// Byte offset of the per-CPU state array within the SHMEM
+/// header page. Each entry is one cache line. Cross-layer drift
+/// pinned in `bifrost-wire` as `SHMEM_PER_CPU_STATE_OFF`.
+pub(crate) const SHMEM_PER_CPU_STATE_OFF: u32 = 128;
+
+/// Stride between successive CPU state entries (one cache
+/// line). Cross-layer drift pinned in `bifrost-wire` as
+/// `SHMEM_PER_CPU_STATE_STRIDE`.
+pub(crate) const SHMEM_PER_CPU_STATE_STRIDE: u32 = 64;
 
 /// Phase 3a SHMEM sub-region layout (offsets within the 16 MB
 /// region, all 4 KB aligned). Kept in sync with the host's

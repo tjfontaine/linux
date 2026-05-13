@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: be23041b61b3e776065ba712b028de6e701717a7ea0d100009c3129e848b59b5
+// CANONICAL_SHA256: 4549cfc92f0cf601db5d4faf507548695783b5a286b7d2b91f16561c25938cb7
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -630,8 +630,24 @@ pub const HELLO_REJECT_OTHER: u8 = 99;
 /// sees the same memory. ASCII `BFSH` interpreted as little-endian.
 pub const SHMEM_MAGIC: u32 = 0x48534642;
 /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
-/// header layout changes incompatibly.
-pub const SHMEM_VERSION: u32 = 3;
+/// header layout changes incompatibly. V4 introduces the per-CPU
+/// principal buffer carve (W1 in `docs/dtrace-roadmap.md`):
+/// the 6 MB ring is split into `SHMEM_NUM_CPUS_MAX` sub-rings of
+/// `per_cpu_ring_len` each, with one cache line of producer /
+/// consumer / drop state per CPU at offset 128.
+pub const SHMEM_VERSION: u32 = 4;
+/// Cap on per-CPU sub-rings. Hosts with more CPUs than the cap
+/// share a sub-ring (`smp_processor_id() % num_cpus` selection
+/// at reserve time). Cross-layer drift pinned in
+/// `third_party/linux-bifrost/drivers/bifrost/shmem_layout.rs`
+/// as `SHMEM_NUM_CPUS_MAX` and `BIFROST_NUM_CPUS_MAX` in
+/// `kernel/bpf/helpers.c`.
+pub const SHMEM_NUM_CPUS_MAX: u32 = 16;
+/// Byte offset of the per-CPU state array within the SHMEM
+/// header page. Each entry is one cache line.
+pub const SHMEM_PER_CPU_STATE_OFF: u32 = 128;
+/// Stride between successive CPU state entries (one cache line).
+pub const SHMEM_PER_CPU_STATE_STRIDE: u32 = 64;
 /// 8-byte record header: u32 size, u32 flags.
 pub const SHMEM_RECORD_HDR_SIZE: usize = 8;
 pub const SHMEM_RECORD_FLAG_READY: u32 = 1;
