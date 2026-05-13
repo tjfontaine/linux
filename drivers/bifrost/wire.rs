@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 9f8779b23cebea9ea83daae30d07c1ba076508587b683056bbc02dea9fa9d78b
+// CANONICAL_SHA256: be23041b61b3e776065ba712b028de6e701717a7ea0d100009c3129e848b59b5
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -9,21 +9,27 @@
 // a matching re-vendor from the canonical.
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
 //
-// Wire-format contract shared across the three bifrost layers.
-// This file is the **canonical** source.  The other two layers
-// (libkrun virtio device, guest kernel module) consume it via
-// SYMLINK rather than vendoring + lint-diff:
+// Wire-format contract for the Bifrost semantic protocol.  This
+// file is the **canonical** source.  Other layers consume it:
 //
-//   third_party/smolvm/libkrun/src/devices/src/virtio/bifrost/wire.rs
-//     → ../../../../../../bifrost-wire/src/lib.rs (resolves via the
-//        smolvm-level `bifrost-wire -> ../../host/bifrost-wire` symlink)
+//   guest kernel module:
+//     third_party/linux-bifrost/drivers/bifrost/wire.rs
+//       — VENDORED COPY with a SHA-pinned header.  The kernel
+//         build runs inside a krunvm with only libkrunfw/ mounted,
+//         so a symlink to host/bifrost-wire/src/lib.rs would not
+//         resolve at build time.  Vendoring + SHA pin gives the
+//         same anti-drift guarantee with manual sync discipline;
+//         the pin is audited by scripts/check-proto-drift.sh.
 //
-//   third_party/linux-bifrost/drivers/bifrost/wire.rs
-//     → ../../../../host/bifrost-wire/src/lib.rs
+//   libkrun (vmm/devices crate):
+//     Does **not** consume this file.  The libkrun-side virtio
+//     adapter at third_party/smolvm/libkrun/src/devices/src/
+//     virtio/conduit/mod.rs treats Bifrost LOAD_PROG payloads as
+//     opaque bytes; only the **generic** virtio-conduit transport
+//     constants (KIND_*, ring layout) cross the libkrun boundary,
+//     and those live in host/virtio-conduit/, not here.
 //
-// Symlinking means there is exactly one set of bytes to maintain;
-// the body-diff lint dance the previous vendoring approach
-// required is gone.  Tests for the constants live in
+// Tests for the constants live in
 // `host/bifrost-wire/tests/constant_pins.rs` (out of this file
 // so kernel-rust isn't asked to parse a `mod tests` block that
 // references std-only macros).
@@ -35,7 +41,7 @@
 // when the same bytes ship in both licensing contexts.
 //
 // `#![no_std]` so this lives equally well in the host CLI's full
-// std crate, the libkrun host VMM, and the guest kernel module.
+// std crate and the guest kernel module.
 //
 // Visibility: `pub` is correct on the canonical/host side (the
 // crate root re-exports it).  Kernel-rust warns "unreachable pub

@@ -100,7 +100,9 @@ use slots::{
     INITIAL_SLOT_HINT,
 };
 use symtab_snapshot::push_symtab_snapshot_cb;
-use types::{BifrostCmd, BpfInsn, MapDef};
+use types::{
+    read_u32_le_unaligned, BifrostCmd, BpfInsn, MapDef, BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
+};
 use shmem_layout::{
     SHMEM_BTF_CAP, SHMEM_BTF_OFF, SHMEM_HDR_LEN, SHMEM_HDR_OFF, SHMEM_KSYMS_CAP, SHMEM_KSYMS_OFF,
     SHMEM_MAGIC, SHMEM_N_PAGES, SHMEM_REGION_SIZE, SHMEM_RINGBUF_LEN, SHMEM_RINGBUF_OFF,
@@ -522,12 +524,15 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         let uprobe_file_offset = layout.uprobe_file_offset;
 
                         let maps_base = payload_base.add(layout.maps_off);
-                        // MapDef is 24 bytes (4×u32 + i32 + u32 flags with
-                        // agg_kind in the low byte). The parser already
-                        // validated `num_maps * MAP_DEF_SIZE` fits within
-                        // the declared payload.
-                        let map_def_size = core::mem::size_of::<MapDef>();
-                        
+                        // MapDef is 24 bytes (4×u32 + i32 + u32 flags
+                        // with agg_kind in the low byte). The parser
+                        // already validated `num_maps * MAP_DEF_WIRE_SIZE`
+                        // fits within the declared payload. The array
+                        // base offset can be odd (variable-length string
+                        // trailers above), so reads must go through the
+                        // little-endian byte-copy helper.
+                        let map_def_size = MAP_DEF_WIRE_SIZE;
+
                         // --- Phase 1: Parse maps, allocate bpf_map via
                         // the standard kernel allocator path. Map types
                         // remaining in use post-SHMEM-migration are
@@ -537,7 +542,9 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // SHMEM data plane.
                         for i in 0..num_maps as usize {
                             if i >= 8 { break; }
-                            let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
+                            let map_def =
+                                MapDef::read_le_unaligned(maps_base.add(i * map_def_size));
+                            let map_def = &map_def;
 
                             // Dedup across LOAD_PROGs: if this fake_fd matches
                             // a map we already allocated (e.g. the shared
@@ -622,7 +629,8 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // program's verify) and the verifier rejects with
                         // "fd N is not pointing to valid bpf_map".
                         for i in 0..num_maps as usize {
-                            let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
+                            let map_def =
+                                MapDef::read_le_unaligned(maps_base.add(i * map_def_size));
                             let slot = (0..(*bg).num_maps as usize)
                                 .find(|&j| BIFROST_MAP_FAKE_FDS[j] == map_def.fake_fd);
                             let Some(slot) = slot else { continue };
@@ -647,11 +655,22 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // --- Phase 2: Parse BPF instructions ---
                         // Offsets/counts come from the parser-produced layout;
                         // we never re-derive them from raw pointer math here.
+                        // Variable-length string trailers above can leave
+                        // `insns_off` on an odd byte, so per-instruction
+                        // reads and writes go through the LE byte-copy
+                        // helpers on `BpfInsn`.
                         let num_insns = layout.num_insns;
-                        let insns_base = payload_base.add(layout.insns_off) as *mut BpfInsn;
+                        let insns_base = payload_base.add(layout.insns_off) as *mut u8;
+                        // SAFETY: parser already bounded `num_insns *
+                        // BPF_INSN_WIRE_SIZE` against the declared
+                        // payload length; callers pass indices below
+                        // `num_insns`.
+                        let insn_at = |i: u32| -> *mut u8 {
+                            unsafe { insns_base.add((i as usize) * BPF_INSN_WIRE_SIZE) }
+                        };
 
                         pr_info!("bifrost_guest: {} BPF instructions received\n", num_insns);
-                        
+
                         // --- Phase 3: Patch instructions ---
                         // Single path: rewrite LD_IMM64 fake_fd→real_fd for
                         // every map reference; leave BPF_CALL alone (the
@@ -659,7 +678,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // The bypass-verifier path retired (goal item 5).
                         let mut idx = 0u32;
                         while idx < num_insns {
-                            let insn = &mut *insns_base.add(idx as usize);
+                            let insn = BpfInsn::read_le_unaligned(insn_at(idx));
 
                             if insn.code == 0x18 && insn.src_reg() == 1 {
                                 let fake_fd = insn.imm;
@@ -674,13 +693,17 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                     let j = map_slot as usize;
                                     let real_fd = BIFROST_MAP_REAL_FDS[j];
                                     if real_fd >= 0 {
-                                        insn.imm = real_fd;
+                                        let mut patched = insn;
+                                        patched.imm = real_fd;
                                         // Keep src_reg=BPF_PSEUDO_MAP_FD(1) — the
                                         // verifier flips this to MAP_VALUE/PTR
                                         // and rewrites imm to the kernel addr.
+                                        BpfInsn::write_le_unaligned(insn_at(idx), patched);
                                         if idx + 1 < num_insns {
-                                            let insn2 = &mut *insns_base.add((idx + 1) as usize);
+                                            let mut insn2 =
+                                                BpfInsn::read_le_unaligned(insn_at(idx + 1));
                                             insn2.imm = 0;
+                                            BpfInsn::write_le_unaligned(insn_at(idx + 1), insn2);
                                         }
                                     }
                                 }
@@ -731,10 +754,18 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                 reloc_failure_detail[..n].copy_from_slice(&msg[..n]);
                                 reloc_failure_detail_len = n;
                             } else {
+                                // Reloc trailer entries may land on any
+                                // byte alignment (the `u8 name_len` field
+                                // makes the next `u32 insn_idx` follow at
+                                // 4+1+name_len = name_len+5 bytes — odd
+                                // whenever name_len is even). Reads use
+                                // the LE byte-copy helper; the patched
+                                // `imm` write goes through
+                                // `BpfInsn::write_le_unaligned`.
                                 let mut walk = relocs_base.add(4);
                                 let mut name_buf = [0u8; 256];
                                 for _ in 0..num_relocs {
-                                    let insn_idx = *(walk as *const u32) as usize;
+                                    let insn_idx = read_u32_le_unaligned(walk) as usize;
                                     walk = walk.add(4);
                                     let name_len = *walk as usize;
                                     walk = walk.add(1);
@@ -782,8 +813,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                         reloc_failure_detail_len = copy;
                                         break;
                                     }
-                                    let target_insn = &mut *insns_base.add(insn_idx);
+                                    let target_ptr = insn_at(insn_idx as u32);
+                                    let mut target_insn = BpfInsn::read_le_unaligned(target_ptr);
                                     target_insn.imm = btf_id;
+                                    BpfInsn::write_le_unaligned(target_ptr, target_insn);
                                     let nm = core::str::from_utf8(&name_buf[..name_len]).unwrap_or("?");
                                     pr_info!(
                                         "bifrost_guest:   reloc insn[{}] '{}' -> btf_id {}\n",
@@ -841,7 +874,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             continue;
                         }
 
-                        let insn_bytes = (num_insns as usize) * 8;
+                        let insn_bytes = (num_insns as usize) * BPF_INSN_WIRE_SIZE;
                         let prog = bpf_prog_alloc(insn_bytes as u32, bindings::GFP_KERNEL);
                         let mut prog_ok = false;
                         if !prog.is_null() {
@@ -853,12 +886,14 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             // bpf_check; the manual override the bypass path
                             // needed is gone.
 
+                            // `dst` (inside the freshly allocated
+                            // `bpf_prog`) is `bpf_insn`-aligned, but
+                            // `insns_base` may be on an odd byte (variable
+                            // string trailers). `copy_nonoverlapping`
+                            // through `*mut u8` is correct for either
+                            // alignment.
                             let dst = &mut (*prog).__bindgen_anon_1 as *mut _ as *mut u8;
-                            core::ptr::copy_nonoverlapping(
-                                insns_base as *const u8,
-                                dst,
-                                insn_bytes,
-                            );
+                            core::ptr::copy_nonoverlapping(insns_base, dst, insn_bytes);
 
                             // fbt:: probes (PROBE_TYPE_FENTRY/FEXIT): override
                             // the kprobe defaults set above to put the prog

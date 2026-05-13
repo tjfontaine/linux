@@ -13,7 +13,10 @@ use kernel::ffi::c_int;
 use kernel::prelude::*;
 
 use crate::bpf_consts::{BPF_LD_IMM64, BPF_PSEUDO_MAP_FD};
-use crate::types::{BifrostCmd, BpfInsn, MapDef};
+use crate::types::{
+    read_u32_le_unaligned, read_u64_le_unaligned, BifrostCmd, BpfInsn, MapDef,
+    BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
+};
 use crate::wire::{
     PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
     PROBE_TYPE_USDT,
@@ -101,12 +104,18 @@ pub(crate) unsafe fn parse_load_prog(
     unsafe {
         const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
         const FIXED: usize = 4 + 32 + 4;
-        const MAP_DEF_SIZE: usize = core::mem::size_of::<MapDef>();
-        const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
 
         if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
             return Err(-(bindings::EINVAL as i32));
         }
+        // `BifrostCmd` header is naturally 4-aligned and lives at
+        // the start of the kmalloc-backed control buffer; the `len`
+        // field load here is the only typed read against `cmd`
+        // itself. Everything after the header (the payload) is
+        // accessed through `read_u32_le_unaligned` /
+        // `read_u64_le_unaligned` / `{MapDef, BpfInsn}::read_le_unaligned`
+        // so variable-length string trailers cannot leave a later
+        // wide field on an odd offset.
         let declared = (*cmd).len as usize;
         let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
         if declared > avail || declared < FIXED {
@@ -130,9 +139,9 @@ pub(crate) unsafe fn parse_load_prog(
         if !need(0, FIXED) {
             return Err(-(bindings::EINVAL as i32));
         }
-        layout.num_maps = *(base as *const u32);
+        layout.num_maps = read_u32_le_unaligned(base);
         core::ptr::copy_nonoverlapping(base.add(4), layout.target_name.as_mut_ptr(), 32);
-        layout.flags = *(base.add(4 + 32) as *const u32);
+        layout.flags = read_u32_le_unaligned(base.add(4 + 32));
         layout.probe_type = (layout.flags & 0xff) as u8;
 
         let mut off = FIXED;
@@ -143,7 +152,7 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let path_len = *(base.add(off) as *const u32) as usize;
+                let path_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if path_len > UPROBE_PATH_MAX || !need(off, path_len) {
                     pr_err!(
@@ -163,14 +172,18 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 8) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                layout.uprobe_file_offset = *(base.add(off) as *const u64);
+                // `path_len` is attacker-controlled, so this u64 lands
+                // on `4+32+4+4+path_len` — odd whenever path_len is
+                // odd. The unaligned helper byte-copies through a
+                // stack array.
+                layout.uprobe_file_offset = read_u64_le_unaligned(base.add(off));
                 off += 8;
             }
             PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let bn_len = *(base.add(off) as *const u32) as usize;
+                let bn_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
                     pr_err!(
@@ -190,7 +203,7 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let sym_len = *(base.add(off) as *const u32) as usize;
+                let sym_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if sym_len == 0 || sym_len > UPROBE_SYMBOL_MAX || !need(off, sym_len) {
                     pr_err!(
@@ -212,7 +225,7 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let bn_len = *(base.add(off) as *const u32) as usize;
+                let bn_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
                     pr_err!(
@@ -232,7 +245,7 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let prov_len = *(base.add(off) as *const u32) as usize;
+                let prov_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if prov_len == 0 || prov_len > UPROBE_PROVIDER_MAX || !need(off, prov_len) {
                     pr_err!(
@@ -252,7 +265,7 @@ pub(crate) unsafe fn parse_load_prog(
                 if !need(off, 4) {
                     return Err(-(bindings::EINVAL as i32));
                 }
-                let probe_len = *(base.add(off) as *const u32) as usize;
+                let probe_len = read_u32_le_unaligned(base.add(off)) as usize;
                 off += 4;
                 if probe_len == 0 || probe_len > UPROBE_SYMBOL_MAX || !need(off, probe_len) {
                     pr_err!(
@@ -273,7 +286,10 @@ pub(crate) unsafe fn parse_load_prog(
             _ => {}
         }
 
-        // MapDef array.
+        // MapDef array. We only validate length and stash an offset
+        // here — dispatch reads MapDef fields via
+        // `MapDef::read_le_unaligned` because variable-length string
+        // trailers above can leave `maps_off` on an odd byte.
         if (layout.num_maps as usize) > MAX_MAPS_PER_PROG {
             pr_err!(
                 "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap {}\n",
@@ -282,7 +298,7 @@ pub(crate) unsafe fn parse_load_prog(
             );
             return Err(-(bindings::EINVAL as i32));
         }
-        let map_bytes = match (layout.num_maps as usize).checked_mul(MAP_DEF_SIZE) {
+        let map_bytes = match (layout.num_maps as usize).checked_mul(MAP_DEF_WIRE_SIZE) {
             Some(v) => v,
             None => return Err(-(bindings::EINVAL as i32)),
         };
@@ -297,9 +313,9 @@ pub(crate) unsafe fn parse_load_prog(
             return Err(-(bindings::EINVAL as i32));
         }
         layout.insns_header_off = off;
-        layout.num_insns = *(base.add(off) as *const u32);
+        layout.num_insns = read_u32_le_unaligned(base.add(off));
         off += 4;
-        let insn_bytes = match (layout.num_insns as usize).checked_mul(INSN_SIZE) {
+        let insn_bytes = match (layout.num_insns as usize).checked_mul(BPF_INSN_WIRE_SIZE) {
             Some(v) => v,
             None => return Err(-(bindings::EINVAL as i32)),
         };
@@ -308,12 +324,12 @@ pub(crate) unsafe fn parse_load_prog(
         }
         layout.insns_off = off;
 
-        // LD_IMM64 pseudo-fd insns occupy two slots; the second slot must
-        // exist. Walk to catch a truncated trailing pair.
-        let insns = base.add(off) as *const BpfInsn;
+        // LD_IMM64 pseudo-fd insns occupy two slots; the second slot
+        // must exist. Walk to catch a truncated trailing pair.
+        let insns_base = base.add(off);
         let mut idx = 0usize;
         while idx < layout.num_insns as usize {
-            let insn = &*insns.add(idx);
+            let insn = BpfInsn::read_le_unaligned(insns_base.add(idx * BPF_INSN_WIRE_SIZE));
             if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
                 if idx + 1 >= layout.num_insns as usize {
                     pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
@@ -331,13 +347,13 @@ pub(crate) unsafe fn parse_load_prog(
             return Err(-(bindings::EINVAL as i32));
         }
         layout.relocs_off = off;
-        layout.num_relocs = *(base.add(off) as *const u32);
+        layout.num_relocs = read_u32_le_unaligned(base.add(off));
         off += 4;
         for _ in 0..layout.num_relocs as usize {
             if !need(off, 5) {
                 return Err(-(bindings::EINVAL as i32));
             }
-            let insn_idx = *(base.add(off) as *const u32) as usize;
+            let insn_idx = read_u32_le_unaligned(base.add(off)) as usize;
             off += 4;
             let name_len = *base.add(off) as usize;
             off += 1;
