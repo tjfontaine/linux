@@ -6311,6 +6311,70 @@ int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, u64 *out_av
 EXPORT_SYMBOL_GPL(bifrost_map_lookup_avg_u64);
 
 /*
+ * W5 (DTrace stddev): reduce a per-cpu map's 24-byte slots
+ * (`{n, sum, sum_of_squares}`) into three host-visible
+ * counters. The host computes the actual standard deviation
+ * from the triple via the population-variance formula
+ *
+ *     stddev = sqrt((sum_sq * n - sum*sum) / (n * (n-1)))
+ *
+ * at xagg-render time — keeping the kernel-side reduction to
+ * straight integer adds (no sqrt) keeps the BPF program shape
+ * the same as count/sum/avg.
+ *
+ * Returns -EINVAL on bad args, -ENOENT if no CPU has a sample,
+ * 0 on success.
+ */
+int bifrost_map_lookup_stddev_u64(struct bpf_map *map, const void *key,
+				  u64 *out_n, u64 *out_sum, u64 *out_sum_sq)
+{
+	void *val_ptr;
+	int cpu;
+
+	if (!map || !map->ops || !out_n || !out_sum || !out_sum_sq)
+		return -EINVAL;
+	if (map->value_size < 24)
+		return -EINVAL;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		u64 n = 0, sum = 0, sum_sq = 0;
+		for_each_possible_cpu(cpu) {
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (val_ptr) {
+				n      += ((u64 *)val_ptr)[0];
+				sum    += ((u64 *)val_ptr)[1];
+				sum_sq += ((u64 *)val_ptr)[2];
+			}
+		}
+		if (n == 0)
+			return -ENOENT;
+		*out_n      = n;
+		*out_sum    = sum;
+		*out_sum_sq = sum_sq;
+		return 0;
+	}
+
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	{
+		u64 n      = ((u64 *)val_ptr)[0];
+		u64 sum    = ((u64 *)val_ptr)[1];
+		u64 sum_sq = ((u64 *)val_ptr)[2];
+		if (n == 0)
+			return -ENOENT;
+		*out_n      = n;
+		*out_sum    = sum;
+		*out_sum_sq = sum_sq;
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_stddev_u64);
+
+/*
  * Bifrost verifier shim. Runs the standard kernel BPF verifier
  * against a pre-loaded bpf_prog using `bpf_check`, with output
  * directed to the kernel log via `BPF_LOG_KERNEL`. Returns 0 on

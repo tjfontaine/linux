@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 4549cfc92f0cf601db5d4faf507548695783b5a286b7d2b91f16561c25938cb7
+// CANONICAL_SHA256: 298055b368127bfb5a724afdb27abc55e0f0aff91d8c881dfda7df630010125e
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -148,6 +148,12 @@ pub const AGG_KIND_SUM: u8 = 0;
 pub const AGG_KIND_MIN: u8 = 1;
 pub const AGG_KIND_MAX: u8 = 2;
 pub const AGG_KIND_AVG: u8 = 3;
+/// `stddev()` aggregation. Per-CPU slot is
+/// `[n:u64][sum:u64][sum_of_squares:u64]` (value_size = 24);
+/// snapshot rows carry the full 24 bytes so the host xagg
+/// renderer can compute
+/// `sqrt((sum_sq * n - sum*sum) / (n * (n-1)))` at render time.
+pub const AGG_KIND_STDDEV: u8 = 4;
 
 // =====================================================================
 // SHMEM record probe-id magics.  Stored at offset 4 of every

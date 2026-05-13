@@ -120,6 +120,15 @@ extern int bifrost_map_lookup_max_u64(struct bpf_map *map, const void *key, unsi
  * across CPUs, returns sum/count. -ENOENT if total count is 0.
  */
 extern int bifrost_map_lookup_avg_u64(struct bpf_map *map, const void *key, unsigned long long *out_avg);
+/* STDDEV: per-cpu slot is [n:u64][sum:u64][sum_of_squares:u64]
+ * (value_size=24). Sums all three across CPUs, returns the
+ * triple to the host so xagg can compute
+ * sqrt((sum_sq * n - sum*sum) / (n * (n-1))). -ENOENT if total
+ * n is 0. */
+extern int bifrost_map_lookup_stddev_u64(struct bpf_map *map, const void *key,
+					 unsigned long long *out_n,
+					 unsigned long long *out_sum,
+					 unsigned long long *out_sum_sq);
 /* Bifrost verifier shim — runs the standard kernel BPF verifier
  * via bpf_check, with verbose output to dmesg via BPF_LOG_KERNEL.
  * Caller must (a) bpf_prog_alloc + set type/len + copy insns,
