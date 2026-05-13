@@ -811,22 +811,22 @@ unsafe fn attach_slot_uprobe(
         // Goal item 6: TaskRef releases the task ref on drop, even
         // through the early-break branches inside the chain below.
         let basename = path_basename(uprobe_path_buf);
-        if !basename.is_empty()
-            && let Some(task) = TaskRef::find(basename)
-        {
-            let exe = get_task_exe_file(task.as_ptr());
-            // Drop the task ref before fput on exe — neither
-            // depends on the other after exe_file is captured.
-            drop(task);
-            if !exe.is_null() {
-                let exe_inode = (*exe).f_inode;
-                pinned = igrab(exe_inode);
-                // Drop the file ref — the inode pin (igrab refcount)
-                // is sufficient to keep the inode alive for the
-                // lifetime of the uprobe.
-                fput(exe);
-                if !pinned.is_null() {
-                    resolved_via = "exe_file";
+        if !basename.is_empty() {
+            if let Some(task) = TaskRef::find(basename) {
+                let exe = get_task_exe_file(task.as_ptr());
+                // Drop the task ref before fput on exe — neither
+                // depends on the other after exe_file is captured.
+                drop(task);
+                if !exe.is_null() {
+                    let exe_inode = (*exe).f_inode;
+                    pinned = igrab(exe_inode);
+                    // Drop the file ref — the inode pin (igrab refcount)
+                    // is sufficient to keep the inode alive for the
+                    // lifetime of the uprobe.
+                    fput(exe);
+                    if !pinned.is_null() {
+                        resolved_via = "exe_file";
+                    }
                 }
             }
         }

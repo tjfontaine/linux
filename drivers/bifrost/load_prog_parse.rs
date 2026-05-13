@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 // Bounded parser for direct LOAD_PROG command payloads.
+//
+// The parser is the single source of truth for the LOAD_PROG byte layout.
+// It walks the command body, validates every read against the declared
+// length, and returns a `LoadProgLayout` containing the offsets, counts,
+// and extracted trailer strings the dispatch needs. The dispatch in
+// `bifrost.rs` consumes that struct exclusively — no pointer-arithmetic
+// re-derivation of trailer boundaries lives in the dispatch path.
 
 use kernel::bindings;
 use kernel::ffi::c_int;
@@ -12,7 +19,85 @@ use crate::wire::{
     PROBE_TYPE_USDT,
 };
 
-pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32) -> c_int {
+/// Caps mirroring the historical inline scratch buffers. Bumping any of
+/// these requires bumping the matching field in `LoadProgLayout`.
+pub(crate) const UPROBE_PATH_MAX: usize = 256;
+pub(crate) const UPROBE_BASENAME_MAX: usize = 64;
+pub(crate) const UPROBE_SYMBOL_MAX: usize = 256;
+pub(crate) const UPROBE_PROVIDER_MAX: usize = 64;
+/// Driver cap on per-program maps; checked here so the dispatch never
+/// has to re-check.
+pub(crate) const MAX_MAPS_PER_PROG: usize = 8;
+
+/// Validated offsets, lengths, and extracted strings for one LOAD_PROG
+/// command body. Every byte offset is relative to `payload_base`, the
+/// first byte after `BifrostCmd::data` (i.e. after `op` + `len`).
+#[repr(C)]
+pub(crate) struct LoadProgLayout {
+    pub(crate) num_maps: u32,
+    pub(crate) target_name: [u8; 32],
+    pub(crate) flags: u32,
+    pub(crate) probe_type: u8,
+
+    /// Byte offset of the MapDef array from `payload_base`.
+    pub(crate) maps_off: usize,
+    /// Byte offset of the `num_insns` u32 from `payload_base`.
+    pub(crate) insns_header_off: usize,
+    /// Byte offset of the first eBPF instruction from `payload_base`.
+    pub(crate) insns_off: usize,
+    pub(crate) num_insns: u32,
+    /// Byte offset of the `num_relocs` u32 from `payload_base`.
+    pub(crate) relocs_off: usize,
+    pub(crate) num_relocs: u32,
+
+    /// Uprobe trailer scratch. `*_len = 0` ⇒ field not present in this
+    /// probe shape. `uprobe_path_buf` is NUL-padded for callers that
+    /// hand it straight to a C-string consumer.
+    pub(crate) uprobe_path_buf: [u8; UPROBE_PATH_MAX + 1],
+    pub(crate) uprobe_path_len: usize,
+    pub(crate) uprobe_basename: [u8; UPROBE_BASENAME_MAX + 1],
+    pub(crate) uprobe_basename_len: usize,
+    pub(crate) uprobe_symbol: [u8; UPROBE_SYMBOL_MAX + 1],
+    pub(crate) uprobe_symbol_len: usize,
+    pub(crate) uprobe_provider: [u8; UPROBE_PROVIDER_MAX + 1],
+    pub(crate) uprobe_provider_len: usize,
+    pub(crate) uprobe_file_offset: u64,
+}
+
+impl LoadProgLayout {
+    fn zeroed() -> Self {
+        Self {
+            num_maps: 0,
+            target_name: [0; 32],
+            flags: 0,
+            probe_type: 0,
+            maps_off: 0,
+            insns_header_off: 0,
+            insns_off: 0,
+            num_insns: 0,
+            relocs_off: 0,
+            num_relocs: 0,
+            uprobe_path_buf: [0; UPROBE_PATH_MAX + 1],
+            uprobe_path_len: 0,
+            uprobe_basename: [0; UPROBE_BASENAME_MAX + 1],
+            uprobe_basename_len: 0,
+            uprobe_symbol: [0; UPROBE_SYMBOL_MAX + 1],
+            uprobe_symbol_len: 0,
+            uprobe_provider: [0; UPROBE_PROVIDER_MAX + 1],
+            uprobe_provider_len: 0,
+            uprobe_file_offset: 0,
+        }
+    }
+}
+
+/// Parse and validate a LOAD_PROG command. Returns the parsed layout on
+/// success or a negative errno on any malformed input. Every read goes
+/// through the local `need()` bound check; every multiplication is
+/// `checked_mul`. The parser never allocates and is `no_std`-clean.
+pub(crate) unsafe fn parse_load_prog(
+    cmd: *const BifrostCmd,
+    cmd_len: u32,
+) -> Result<LoadProgLayout, c_int> {
     unsafe {
         const CMD_HDR: usize = core::mem::size_of::<BifrostCmd>();
         const FIXED: usize = 4 + 32 + 4;
@@ -20,7 +105,7 @@ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32
         const INSN_SIZE: usize = core::mem::size_of::<BpfInsn>();
 
         if cmd.is_null() || (cmd_len as usize) < CMD_HDR {
-            return -(bindings::EINVAL as i32);
+            return Err(-(bindings::EINVAL as i32));
         }
         let declared = (*cmd).len as usize;
         let avail = (cmd_len as usize).saturating_sub(CMD_HDR);
@@ -30,133 +115,209 @@ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32
                 declared,
                 avail
             );
-            return -(bindings::EINVAL as i32);
+            return Err(-(bindings::EINVAL as i32));
         }
 
         let base = (cmd as *const u8).add(CMD_HDR);
-        let mut off = 0usize;
         let limit = declared;
-
-        let need = |off: usize, n: usize, limit: usize| -> bool {
+        let need = |off: usize, n: usize| -> bool {
             off.checked_add(n).map_or(false, |end| end <= limit)
         };
-        if !need(off, 4, limit) {
-            return -(bindings::EINVAL as i32);
-        }
-        let num_maps = *(base.add(off) as *const u32) as usize;
-        off += 4 + 32;
-        if !need(off, 4, limit) {
-            return -(bindings::EINVAL as i32);
-        }
-        let flags = *(base.add(off) as *const u32);
-        off += 4;
-        let probe_type = (flags & 0xff) as u8;
 
-        match probe_type {
+        let mut layout = LoadProgLayout::zeroed();
+
+        // num_maps + target_name + flags
+        if !need(0, FIXED) {
+            return Err(-(bindings::EINVAL as i32));
+        }
+        layout.num_maps = *(base as *const u32);
+        core::ptr::copy_nonoverlapping(base.add(4), layout.target_name.as_mut_ptr(), 32);
+        layout.flags = *(base.add(4 + 32) as *const u32);
+        layout.probe_type = (layout.flags & 0xff) as u8;
+
+        let mut off = FIXED;
+
+        // Per-probe trailer.
+        match layout.probe_type {
             PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => {
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let path_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if path_len > 256 || !need(off, path_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if path_len > UPROBE_PATH_MAX || !need(off, path_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG uprobe path_len {} out of range\n",
+                        path_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_path_buf.as_mut_ptr(),
+                    path_len,
+                );
+                layout.uprobe_path_buf[path_len] = 0;
+                layout.uprobe_path_len = path_len;
                 off += path_len;
-                if !need(off, 8, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 8) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                layout.uprobe_file_offset = *(base.add(off) as *const u64);
                 off += 8;
             }
             PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => {
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let bn_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG uprobe-by-sym bn_len {} out of range\n",
+                        bn_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_basename.as_mut_ptr(),
+                    bn_len,
+                );
+                layout.uprobe_basename[bn_len] = 0;
+                layout.uprobe_basename_len = bn_len;
                 off += bn_len;
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let sym_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if sym_len == 0 || sym_len > 256 || !need(off, sym_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if sym_len == 0 || sym_len > UPROBE_SYMBOL_MAX || !need(off, sym_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG uprobe-by-sym sym_len {} out of range\n",
+                        sym_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_symbol.as_mut_ptr(),
+                    sym_len,
+                );
+                layout.uprobe_symbol[sym_len] = 0;
+                layout.uprobe_symbol_len = sym_len;
                 off += sym_len;
             }
             PROBE_TYPE_USDT => {
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let bn_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if bn_len == 0 || bn_len > 64 || !need(off, bn_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if bn_len == 0 || bn_len > UPROBE_BASENAME_MAX || !need(off, bn_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG usdt bn_len {} out of range\n",
+                        bn_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_basename.as_mut_ptr(),
+                    bn_len,
+                );
+                layout.uprobe_basename[bn_len] = 0;
+                layout.uprobe_basename_len = bn_len;
                 off += bn_len;
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let prov_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if prov_len == 0 || prov_len > 64 || !need(off, prov_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if prov_len == 0 || prov_len > UPROBE_PROVIDER_MAX || !need(off, prov_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG usdt prov_len {} out of range\n",
+                        prov_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_provider.as_mut_ptr(),
+                    prov_len,
+                );
+                layout.uprobe_provider[prov_len] = 0;
+                layout.uprobe_provider_len = prov_len;
                 off += prov_len;
-                if !need(off, 4, limit) {
-                    return -(bindings::EINVAL as i32);
+                if !need(off, 4) {
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 let probe_len = *(base.add(off) as *const u32) as usize;
                 off += 4;
-                if probe_len == 0 || probe_len > 256 || !need(off, probe_len, limit) {
-                    return -(bindings::EINVAL as i32);
+                if probe_len == 0 || probe_len > UPROBE_SYMBOL_MAX || !need(off, probe_len) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG usdt probe_len {} out of range\n",
+                        probe_len
+                    );
+                    return Err(-(bindings::EINVAL as i32));
                 }
+                core::ptr::copy_nonoverlapping(
+                    base.add(off),
+                    layout.uprobe_symbol.as_mut_ptr(),
+                    probe_len,
+                );
+                layout.uprobe_symbol[probe_len] = 0;
+                layout.uprobe_symbol_len = probe_len;
                 off += probe_len;
             }
             _ => {}
         }
 
-        if num_maps > 8 {
+        // MapDef array.
+        if (layout.num_maps as usize) > MAX_MAPS_PER_PROG {
             pr_err!(
-                "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap 8\n",
-                num_maps
+                "bifrost_guest: LOAD_PROG num_maps {} exceeds driver cap {}\n",
+                layout.num_maps,
+                MAX_MAPS_PER_PROG
             );
-            return -(bindings::EINVAL as i32);
+            return Err(-(bindings::EINVAL as i32));
         }
-        let map_bytes = match num_maps.checked_mul(MAP_DEF_SIZE) {
+        let map_bytes = match (layout.num_maps as usize).checked_mul(MAP_DEF_SIZE) {
             Some(v) => v,
-            None => return -(bindings::EINVAL as i32),
+            None => return Err(-(bindings::EINVAL as i32)),
         };
-        if !need(off, map_bytes, limit) {
-            return -(bindings::EINVAL as i32);
+        if !need(off, map_bytes) {
+            return Err(-(bindings::EINVAL as i32));
         }
+        layout.maps_off = off;
         off += map_bytes;
 
-        if !need(off, 4, limit) {
-            return -(bindings::EINVAL as i32);
+        // Instruction header + body.
+        if !need(off, 4) {
+            return Err(-(bindings::EINVAL as i32));
         }
-        let num_insns = *(base.add(off) as *const u32) as usize;
+        layout.insns_header_off = off;
+        layout.num_insns = *(base.add(off) as *const u32);
         off += 4;
-        let insn_bytes = match num_insns.checked_mul(INSN_SIZE) {
+        let insn_bytes = match (layout.num_insns as usize).checked_mul(INSN_SIZE) {
             Some(v) => v,
-            None => return -(bindings::EINVAL as i32),
+            None => return Err(-(bindings::EINVAL as i32)),
         };
-        if !need(off, insn_bytes, limit) {
-            return -(bindings::EINVAL as i32);
+        if !need(off, insn_bytes) {
+            return Err(-(bindings::EINVAL as i32));
         }
+        layout.insns_off = off;
 
+        // LD_IMM64 pseudo-fd insns occupy two slots; the second slot must
+        // exist. Walk to catch a truncated trailing pair.
         let insns = base.add(off) as *const BpfInsn;
         let mut idx = 0usize;
-        while idx < num_insns {
+        while idx < layout.num_insns as usize {
             let insn = &*insns.add(idx);
             if insn.code == BPF_LD_IMM64 && insn.src_reg() == BPF_PSEUDO_MAP_FD {
-                if idx + 1 >= num_insns {
+                if idx + 1 >= layout.num_insns as usize {
                     pr_err!("bifrost_guest: LOAD_PROG ldimm64 at final insn {}\n", idx);
-                    return -(bindings::EINVAL as i32);
+                    return Err(-(bindings::EINVAL as i32));
                 }
                 idx += 2;
             } else {
@@ -165,27 +326,30 @@ pub(crate) unsafe fn validate_load_prog_cmd(cmd: *const BifrostCmd, cmd_len: u32
         }
         off += insn_bytes;
 
-        if !need(off, 4, limit) {
-            return -(bindings::EINVAL as i32);
+        // Reloc trailer.
+        if !need(off, 4) {
+            return Err(-(bindings::EINVAL as i32));
         }
-        let num_relocs = *(base.add(off) as *const u32) as usize;
+        layout.relocs_off = off;
+        layout.num_relocs = *(base.add(off) as *const u32);
         off += 4;
-        for _ in 0..num_relocs {
-            if !need(off, 5, limit) {
-                return -(bindings::EINVAL as i32);
+        for _ in 0..layout.num_relocs as usize {
+            if !need(off, 5) {
+                return Err(-(bindings::EINVAL as i32));
             }
             let insn_idx = *(base.add(off) as *const u32) as usize;
             off += 4;
             let name_len = *base.add(off) as usize;
             off += 1;
-            if name_len == 0 || name_len >= 256 || !need(off, name_len, limit) {
-                return -(bindings::EINVAL as i32);
+            if name_len == 0 || name_len >= 256 || !need(off, name_len) {
+                return Err(-(bindings::EINVAL as i32));
             }
-            if insn_idx >= num_insns {
-                return -(bindings::EINVAL as i32);
+            if insn_idx >= layout.num_insns as usize {
+                return Err(-(bindings::EINVAL as i32));
             }
             off += name_len;
         }
-        0
+
+        Ok(layout)
     }
 }

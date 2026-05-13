@@ -33,7 +33,7 @@
 // to land safely; deferred until that build cycle is available):
 //   load_prog/mod.rs         entry + phase orchestration
 //   load_prog/maps.rs        map setup, fake-fd patching
-//   load_prog/verifier.rs    BIFROST_USE_VERIFIER path
+//   load_prog/verifier.rs    Kernel-verifier dispatch wrapper
 //   attach/uprobe.rs         split uprobe + uretprobe out of attach.rs
 //   attach/fbt.rs            split fentry/fexit out of attach.rs
 //   attach/tracepoint.rs     split raw tracepoint out of attach.rs
@@ -91,8 +91,8 @@ mod uprobe_handlers;
 mod wire;
 use agg_snapshot::push_agg_snapshot;
 use attach::{slot_family_attach, slot_family_cleanup, AttachExt};
-use control_reply::complete_load_prog;
-use load_prog_parse::validate_load_prog_cmd;
+use control_reply::{complete_load_prog, complete_load_prog_with_detail};
+use load_prog_parse::parse_load_prog;
 use shmem_init::send_shmem_init;
 use shmem_publish::{populate_shmem_btf, populate_shmem_kallsyms};
 use slots::{
@@ -107,8 +107,7 @@ use shmem_layout::{
     SHMEM_VERSION, SHMEM_VMA_CACHE_LEN, SHMEM_VMA_CACHE_OFF,
 };
 use wire::{
-    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
-    PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT,
 };
 
 module! {
@@ -225,6 +224,14 @@ const EVENT_OPENAT: u32 = 1;
 /// bpf_link_init+0x8 with a translation fault on virt addr 0x0/0x8.
 /// All callbacks None → no spurious WARN, and they're never called
 /// because we manage the link's lifecycle in-driver.
+//
+// HACK(upstream-able): bpf_link_init unconditionally dereferences `ops`
+// for the dealloc/dealloc_deferred WARN_ON. In-driver lifecycle owners
+// like bifrost have no userspace fd, so a NULL ops would be the natural
+// shape. A one-liner in kernel/bpf/syscall.c that early-returns the
+// WARN_ON on `!ops` (or tolerates a NULL ops for non-fd link consumers)
+// would let us drop this stub. File upstream with netdev/BPF
+// maintainers; until then, the all-None struct keeps WARN quiet.
 pub(crate) static mut BIFROST_TRACING_LINK_OPS: bindings::bpf_link_ops = bindings::bpf_link_ops {
     release: None,
     dealloc: None,
@@ -251,23 +258,38 @@ pub(crate) static mut BIFROST_MAP_AGG_KIND: [u8; 8] = [0; 8];
 /// release them after verification — the prog holds its own ref.
 static mut BIFROST_MAP_REAL_FDS: [i32; 8] = [-1; 8];
 
-/// LAYER 2 — when true, route every LOAD_PROG through the kernel
-/// verifier (`bifrost_verify_prog`). When false, fall back to the
-/// hand-patched bypass-verifier path (resolves fake_fds to map ptrs
-/// inline, helper ids to `__bpf_call_base + offset`, and manually
-/// sets aux->stack_depth before bpf_prog_select_runtime).
-///
-/// Implemented as an atomic so `module_param` can flip it at runtime
-/// (with `modprobe bifrost_guest use_verifier=1` or via sysfs) without
-/// rebuilding. Default off until the path is proven; flip to default-on
-/// once layer-2 demos pass.
-pub static BIFROST_USE_VERIFIER: AtomicBool = AtomicBool::new(true);
+// Bypass-verifier path retired (Phase L, goal item 5). Every LOAD_PROG
+// routes through `bifrost_verify_prog` against the standard kernel BPF
+// verifier — no toggle, no module_param. The historical AtomicBool flag
+// and its `__bpf_call_base + offset` patch arm are gone; the kernel
+// verifier resolves pseudo-ldimm64 (real_fd → bpf_map*) and helper-id →
+// addr during bpf_check, then bpf_prog_select_runtime JITs the result.
+//
+// Removing the bypass path also drops the `bifrost_get_stack` shim
+// (verifier mode uses the real `bpf_get_stack_proto` natively) and the
+// manual `aux->stack_depth = 512` set (bpf_check computes the real
+// frame size).
 
-/// The current helper surface is intentionally singleton: SHMEM
-/// reserve/submit and the doorbell kfunc are published through global
-/// kernel/bpf helper state. Reject a second virtio-bifrost device
-/// rather than sharing slots, map fake-fd caches, and callback private
-/// data across devices.
+/// SINGLETON DEVICE INVARIANT (goal item 10).
+///
+/// The bifrost helper surface — `bifrost_shmem_va`/`bifrost_shmem_len`,
+/// `bifrost_kick_fn`/`bifrost_kick_priv` in kernel/bpf/helpers.c, plus
+/// the in-driver slot table (`slots.rs`), map fake-fd cache
+/// (`BIFROST_MAP_FAKE_FDS`), and probe count (`BIFROST_NUM_KPROBES`)
+/// — are all process-global state that does not multiplex across
+/// virtio-bifrost device instances.
+///
+/// `bifrost_probe` compare-exchanges this flag to claim ownership and
+/// returns `-EBUSY` if a second device tries to attach. Every probe
+/// failure path resets the flag (search `BIFROST_DEVICE_LIVE.store`
+/// for the audit trail); `bifrost_remove` resets it at the very end
+/// of teardown.
+///
+/// If a future deployment ever needs multiple bifrost devices in the
+/// same guest, the work is: move map fake-fd state into
+/// `BifrostGuest`, rework helper globals to reference a current-device
+/// pointer (with RCU), and replace this flag with per-device
+/// registration. Until then, singleton is the contract.
 static BIFROST_DEVICE_LIVE: AtomicBool = AtomicBool::new(false);
 
 extern "C" {
@@ -315,42 +337,11 @@ extern "C" {
 
 // RecordWriter moved to drivers/bifrost/record_writer.rs.
 
-/// Stand-in for bpf_get_stack (helper id 67). bpf_base_func_proto in
-/// our libkrunfw build dereferences prog->expected_attach_type for
-/// this case, and our resolver hands it NULL, so the kernel's proto
-/// crashes. Delegate to `bifrost_stack_walk` — a kernel-side shim
-/// (kernel/bpf/helpers.c) wrapping the arm64 unwinder
-/// (`stack_trace_save_regs` → `arch_stack_walk`) which handles
-/// kprobe context, IRQ stacks, and the kretprobe trampoline correctly.
-///
-/// Args follow the eBPF helper ABI emitted by `lower_action_into`:
-///   r1 = ctx (pt_regs *), r2 = buf, r3 = size, r4 = flags.
-/// Bypass-verifier-only kernel-stack helper. Verifier mode (the
-/// default) skips this entirely — the kernel's
-/// `kprobe_prog_func_proto` resolves helper id 67 to the real
-/// `bpf_get_stack_proto`, which already handles BPF_F_USER_STACK
-/// natively via `__bpf_get_stack` → `get_perf_callchain`. This
-/// shim only runs in bypass mode and only for kernel-stack walks.
-unsafe extern "C" fn bifrost_get_stack(
-    ctx: *mut core::ffi::c_void,
-    buf: *mut core::ffi::c_void,
-    size: u32,
-    _flags: u64,
-) -> i64 {
-    unsafe {
-        if ctx.is_null() || buf.is_null() {
-            return -1;
-        }
-        let nr_entries = (size / 8) as core::ffi::c_uint;
-        let written = bindings::bifrost_stack_walk(
-            ctx as *mut bindings::pt_regs,
-            buf as *mut usize,
-            nr_entries,
-            0,
-        );
-        (written as i64) * 8
-    }
-}
+// `bifrost_get_stack` shim retired (Phase L, goal item 5). With the
+// bypass-verifier path gone, helper id 67 resolves to the kernel's real
+// `bpf_get_stack_proto` via `kprobe_prog_func_proto` during bpf_check.
+// That path handles BPF_F_USER_STACK and kprobe/kretprobe context
+// natively via `__bpf_get_stack` → `get_perf_callchain`.
 
 /// Run the BPF program at `slots_mut()[slot].prog` against `regs`.
 /// The per-slot uprobe handlers (`bifrost_uprobe_handler_N`) are
@@ -363,12 +354,13 @@ unsafe extern "C" fn bifrost_get_stack(
 #[inline(always)]
 pub(crate) unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
     unsafe {
-        // Bounds-check against the live slot-table length, not
-        // the legacy MAX_KPROBES constant.  After the heap
-        // migration the table grows on demand; this check
-        // protects against a stale or out-of-bounds slot index
-        // arriving via container-of from a freed BifrostUprobe
-        // (defense in depth — should never happen in practice).
+        // Bounds-check against the slot-table length.  Post-Phase-L
+        // (goal item 4) the table is pre-allocated full at module
+        // init and never reallocated, so the slice header observed
+        // from IRQ context is stable.  This check is defense in
+        // depth against a stale or out-of-bounds slot index arriving
+        // via container-of from a freed BifrostUprobe — should never
+        // happen in practice.
         if slot >= slots_mut().len() {
             return;
         }
@@ -492,213 +484,49 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
 	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
 	                    if (*cmd).op == 2 { // LOAD_PROG
                         pr_info!("bifrost_guest: processing LOAD_PROG command\n");
-                        let parse_status = validate_load_prog_cmd(cmd, (*bg).cmd_len);
-                        if parse_status != 0 {
-                            pr_err!(
-                                "bifrost_guest: LOAD_PROG rejected by bounded parser: {}\n",
-                                parse_status
-                            );
-                            complete_load_prog(bg, cmd, parse_status);
-                            continue;
-                        }
-                        
-                        // LOAD_PROG payload layout:
-                        //   [0..4]   op: u32 = 2
-                        //   [4..8]   len: u32
-                        //   [8..12]  num_maps: u32
-                        //   [12..44] target_name: [u8; 32]
-                        //   [44..48] flags: u32 (low byte = probe_type)
-                        //   [48..48+num_maps*24]  MapDef array
-                        //   [..+4]   num_insns: u32
-                        //   [..+num_insns*8]  BPF instructions
-                        let payload_ptr = (*bg).ctrl_buf as *const u8;
-                        let payload_base = payload_ptr.add(8); // skip op(4) + len(4)
+                        // The bounded parser is the single source of truth for
+                        // the LOAD_PROG byte layout. It validates lengths,
+                        // extracts trailer strings, and hands back
+                        // `payload_base`-relative offsets for the maps,
+                        // instructions, and reloc trailer. The dispatch below
+                        // consumes `layout` fields exclusively and never
+                        // re-derives an offset by hand.
+                        let layout = match parse_load_prog(cmd, (*bg).cmd_len) {
+                            Ok(l) => l,
+                            Err(parse_status) => {
+                                pr_err!(
+                                    "bifrost_guest: LOAD_PROG rejected by bounded parser: {}\n",
+                                    parse_status
+                                );
+                                complete_load_prog(bg, cmd, parse_status);
+                                continue;
+                            }
+                        };
 
-                        let num_maps = *(payload_base as *const u32);
+                        let payload_ptr = (*bg).ctrl_buf as *const u8;
+                        // Skip BifrostCmd header (op + len = 8 bytes).
+                        let payload_base = payload_ptr.add(core::mem::size_of::<BifrostCmd>());
+
+                        let num_maps = layout.num_maps;
                         pr_info!("bifrost_guest: num_maps={}\n", num_maps);
 
-                        // Extract target_name (32 bytes)
-                        let mut target_name = [0u8; 32];
-                        core::ptr::copy_nonoverlapping(payload_base.add(4), target_name.as_mut_ptr(), 32);
+                        let target_name = layout.target_name;
+                        let probe_type = layout.probe_type;
+                        let uprobe_path_buf = &layout.uprobe_path_buf;
+                        let uprobe_basename = &layout.uprobe_basename;
+                        let uprobe_basename_len = layout.uprobe_basename_len;
+                        let uprobe_symbol = &layout.uprobe_symbol;
+                        let uprobe_symbol_len = layout.uprobe_symbol_len;
+                        let uprobe_provider = &layout.uprobe_provider;
+                        let uprobe_provider_len = layout.uprobe_provider_len;
+                        let uprobe_file_offset = layout.uprobe_file_offset;
 
-                        // Probe-type flags (32 bits; only low byte used).
-                        let flags = *(payload_base.add(4 + 32) as *const u32);
-                        let probe_type: u8 = (flags & 0xff) as u8;
-
-                        // A4 — Uprobe trailer.  Three shapes by probe_type:
-                        //
-                        //   2/3 (host-resolved):
-                        //     u32 path_len, path_bytes, u64 file_offset
-                        //
-                        //   4/5 (kernel-resolved):
-                        //     u32 bn_len, basename_bytes,
-                        //     u32 sym_len, symbol_bytes
-                        //   The driver looks up the matching task by comm
-                        //   (basename), grabs its exe_file, parses the ELF
-                        //   symbol table to find `symbol`'s file offset,
-                        //   then registers the uprobe.  No host rootfs
-                        //   mirror needed.
-                        //
-                        //   9 (USDT, kernel-resolved):
-                        //     u32 bn_len, basename_bytes,
-                        //     u32 prov_len, sdt_provider_bytes,
-                        //     u32 probe_len, sdt_probe_bytes
-                        //   Same task→exe_file path as 4/5; the driver
-                        //   walks `.note.stapsdt` (rather than `.symtab`)
-                        //   to find the matching `(provider, probe)`,
-                        //   then registers a uprobe at the recorded
-                        //   pc + ref_ctr_offset.  bifrost_helper_resolve_usdt
-                        //   does the in-kernel ELF walk.
-                        //
-                        // 0/1 (kprobe/kretprobe) carry no trailer.
-                        let mut uprobe_path_buf: [u8; 257] = [0u8; 257];
-                        let mut uprobe_basename: [u8; 65] = [0u8; 65];
-                        let mut uprobe_basename_len: usize = 0;
-                        let mut uprobe_symbol: [u8; 257] = [0u8; 257];
-                        let mut uprobe_symbol_len: usize = 0;
-                        let mut uprobe_provider: [u8; 65] = [0u8; 65];
-                        let mut uprobe_provider_len: usize = 0;
-                        let mut uprobe_file_offset: u64 = 0;
-                        let mut trailer_bytes: usize = 0;
-                        let mut malformed_trailer = false;
-                        if probe_type == PROBE_TYPE_UPROBE
-                            || probe_type == PROBE_TYPE_URETPROBE
-                        {
-                            let trailer_start = payload_base.add(4 + 32 + 4);
-                            let path_len =
-                                *(trailer_start as *const u32) as usize;
-                            if path_len > 256 {
-                                pr_err!(
-                                    "bifrost_guest: LOAD_PROG uprobe path_len {} > 256\n",
-                                    path_len
-                                );
-                                malformed_trailer = true;
-                            } else {
-                                core::ptr::copy_nonoverlapping(
-                                    trailer_start.add(4),
-                                    uprobe_path_buf.as_mut_ptr(),
-                                    path_len,
-                                );
-                                uprobe_path_buf[path_len] = 0;
-                                uprobe_file_offset = *(trailer_start
-                                    .add(4 + path_len)
-                                    as *const u64);
-                                trailer_bytes = 4 + path_len + 8;
-                            }
-                        } else if probe_type == PROBE_TYPE_USDT {
-                            // Trailer: u32 bn_len ++ bn ++ u32 prov_len ++
-                            // prov ++ u32 probe_len ++ probe.  Three
-                            // length-prefixed strings; mirrors 4/5 with an
-                            // extra (provider) field.
-                            let trailer_start = payload_base.add(4 + 32 + 4);
-                            let bn_len =
-                                *(trailer_start as *const u32) as usize;
-                            if bn_len == 0 || bn_len > 64 {
-                                pr_err!(
-                                    "bifrost_guest: LOAD_PROG usdt bn_len {} out of range\n",
-                                    bn_len
-                                );
-                                malformed_trailer = true;
-                            } else {
-                                core::ptr::copy_nonoverlapping(
-                                    trailer_start.add(4),
-                                    uprobe_basename.as_mut_ptr(),
-                                    bn_len,
-                                );
-                                uprobe_basename[bn_len] = 0;
-                                uprobe_basename_len = bn_len;
-                                let prov_field = trailer_start.add(4 + bn_len);
-                                let prov_len =
-                                    *(prov_field as *const u32) as usize;
-                                if prov_len == 0 || prov_len > 64 {
-                                    pr_err!(
-                                        "bifrost_guest: LOAD_PROG usdt prov_len {} out of range\n",
-                                        prov_len
-                                    );
-                                    malformed_trailer = true;
-                                } else {
-                                    core::ptr::copy_nonoverlapping(
-                                        prov_field.add(4),
-                                        uprobe_provider.as_mut_ptr(),
-                                        prov_len,
-                                    );
-                                    uprobe_provider[prov_len] = 0;
-                                    uprobe_provider_len = prov_len;
-                                    let probe_field =
-                                        prov_field.add(4 + prov_len);
-                                    let probe_len =
-                                        *(probe_field as *const u32) as usize;
-                                    if probe_len == 0 || probe_len > 256 {
-                                        pr_err!(
-                                            "bifrost_guest: LOAD_PROG usdt probe_len {} out of range\n",
-                                            probe_len
-                                        );
-                                        malformed_trailer = true;
-                                    } else {
-                                        core::ptr::copy_nonoverlapping(
-                                            probe_field.add(4),
-                                            uprobe_symbol.as_mut_ptr(),
-                                            probe_len,
-                                        );
-                                        uprobe_symbol[probe_len] = 0;
-                                        uprobe_symbol_len = probe_len;
-                                        trailer_bytes = 4 + bn_len + 4 + prov_len + 4 + probe_len;
-                                    }
-                                }
-                            }
-                        } else if probe_type == PROBE_TYPE_UPROBE_BY_SYM
-                            || probe_type == PROBE_TYPE_URETPROBE_BY_SYM
-                        {
-                            let trailer_start = payload_base.add(4 + 32 + 4);
-                            let bn_len =
-                                *(trailer_start as *const u32) as usize;
-                            if bn_len == 0 || bn_len > 64 {
-                                pr_err!(
-                                    "bifrost_guest: LOAD_PROG uprobe-by-sym bn_len {} out of range\n",
-                                    bn_len
-                                );
-                                malformed_trailer = true;
-                            } else {
-                                core::ptr::copy_nonoverlapping(
-                                    trailer_start.add(4),
-                                    uprobe_basename.as_mut_ptr(),
-                                    bn_len,
-                                );
-                                uprobe_basename[bn_len] = 0;
-                                uprobe_basename_len = bn_len;
-                                let sym_field = trailer_start.add(4 + bn_len);
-                                let sym_len =
-                                    *(sym_field as *const u32) as usize;
-                                if sym_len == 0 || sym_len > 256 {
-                                    pr_err!(
-                                        "bifrost_guest: LOAD_PROG uprobe-by-sym sym_len {} out of range\n",
-                                        sym_len
-                                    );
-                                    malformed_trailer = true;
-                                } else {
-                                    core::ptr::copy_nonoverlapping(
-                                        sym_field.add(4),
-                                        uprobe_symbol.as_mut_ptr(),
-                                        sym_len,
-                                    );
-                                    uprobe_symbol[sym_len] = 0;
-                                    uprobe_symbol_len = sym_len;
-                                    trailer_bytes = 4 + bn_len + 4 + sym_len;
-                                }
-                            }
-                        }
-                        if malformed_trailer {
-                            // Skip processing this command; re-post and
-                            // continue.  Falling through with bad lengths
-                            // would corrupt the maps/insns offsets.
-                            complete_load_prog(bg, cmd, -(bindings::EINVAL as i32));
-                            continue;
-                        }
-
-                        let maps_base = payload_base.add(4 + 32 + 4 + trailer_bytes);
-                        // MapDef bumped to 24 bytes with appended u32 flags
-                        // (low byte = agg_kind for snapshot-worker dispatch).
-                        let map_def_size = 24usize;
+                        let maps_base = payload_base.add(layout.maps_off);
+                        // MapDef is 24 bytes (4×u32 + i32 + u32 flags with
+                        // agg_kind in the low byte). The parser already
+                        // validated `num_maps * MAP_DEF_SIZE` fits within
+                        // the declared payload.
+                        let map_def_size = core::mem::size_of::<MapDef>();
                         
                         // --- Phase 1: Parse maps, allocate bpf_map via
                         // the standard kernel allocator path. Map types
@@ -784,62 +612,51 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             continue;
                         }
 	                        // --- Phase 1b: per-program real-fd allocation. ---
-                        // Layer 2 only. Walk the MapDef array (not just newly-
-                        // allocated maps), look up the slot for each fake_fd,
-                        // and bind a fresh real fd via bifrost_map_get_fd.
-                        // Closed after bifrost_verify_prog returns. Without
-                        // this, a follow-on LOAD_PROG that reuses an existing
-                        // fake_fd (the shared ringbuf, the TLS map) finds
+                        // Walk the MapDef array (not just newly-allocated maps),
+                        // look up the slot for each fake_fd, and bind a fresh
+                        // real fd via bifrost_map_get_fd.  Closed after
+                        // bifrost_verify_prog returns.  Without this, a
+                        // follow-on LOAD_PROG that reuses an existing fake_fd
+                        // (the shared ringbuf, the TLS map) finds
                         // BIFROST_MAP_REAL_FDS[slot] = -1 (closed by the prior
                         // program's verify) and the verifier rejects with
                         // "fd N is not pointing to valid bpf_map".
-                        if BIFROST_USE_VERIFIER.load(core::sync::atomic::Ordering::Relaxed) {
-                            for i in 0..num_maps as usize {
-                                let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
-                                let slot = (0..(*bg).num_maps as usize)
-                                    .find(|&j| BIFROST_MAP_FAKE_FDS[j] == map_def.fake_fd);
-                                let Some(slot) = slot else { continue };
-                                if BIFROST_MAP_REAL_FDS[slot] >= 0 {
-                                    continue; // already have a fresh fd
-                                }
-                                let map_ptr = (*bg).maps[slot];
-                                if map_ptr.is_null() {
-                                    continue;
-                                }
-                                let fd = bindings::bifrost_map_get_fd(map_ptr, 0);
-                                if fd < 0 {
-                                    pr_err!(
-                                        "bifrost_guest: bifrost_map_get_fd failed for slot[{}]: {}\n",
-                                        slot, fd
-                                    );
-                                } else {
-                                    BIFROST_MAP_REAL_FDS[slot] = fd;
-                                    pr_info!(
-                                        "bifrost_guest: layer2 map[{}] (fake_fd={}) real fd={}\n",
-                                        slot, map_def.fake_fd, fd
-                                    );
-                                }
+                        for i in 0..num_maps as usize {
+                            let map_def = &*(maps_base.add(i * map_def_size) as *const MapDef);
+                            let slot = (0..(*bg).num_maps as usize)
+                                .find(|&j| BIFROST_MAP_FAKE_FDS[j] == map_def.fake_fd);
+                            let Some(slot) = slot else { continue };
+                            if BIFROST_MAP_REAL_FDS[slot] >= 0 {
+                                continue; // already have a fresh fd
+                            }
+                            let map_ptr = (*bg).maps[slot];
+                            if map_ptr.is_null() {
+                                continue;
+                            }
+                            let fd = bindings::bifrost_map_get_fd(map_ptr, 0);
+                            if fd < 0 {
+                                pr_err!(
+                                    "bifrost_guest: bifrost_map_get_fd failed for slot[{}]: {}\n",
+                                    slot, fd
+                                );
+                            } else {
+                                BIFROST_MAP_REAL_FDS[slot] = fd;
                             }
                         }
                         
                         // --- Phase 2: Parse BPF instructions ---
-                        let insns_header = maps_base.add(num_maps as usize * map_def_size);
-                        let num_insns = *(insns_header as *const u32);
-                        let insns_base = insns_header.add(4) as *mut BpfInsn;
-                        
+                        // Offsets/counts come from the parser-produced layout;
+                        // we never re-derive them from raw pointer math here.
+                        let num_insns = layout.num_insns;
+                        let insns_base = payload_base.add(layout.insns_off) as *mut BpfInsn;
+
                         pr_info!("bifrost_guest: {} BPF instructions received\n", num_insns);
                         
                         // --- Phase 3: Patch instructions ---
-                        // Two paths:
-                        //  - Layer-2 (verifier on): rewrite LD_IMM64 with the
-                        //    map's REAL fd; leave BPF_CALL alone (verifier
-                        //    resolves helper ids during bpf_check).
-                        //  - Bypass-verifier (verifier off): resolve fake_fd →
-                        //    bpf_map* (clear src_reg) and helper_id → offset
-                        //    inline so the JIT can lower without bpf_check.
-                        let use_verifier = BIFROST_USE_VERIFIER.load(core::sync::atomic::Ordering::Relaxed);
-                        pr_info!("bifrost_guest: Phase 3 starting (use_verifier={})\n", use_verifier);
-                        let bpf_call_base = bindings::__bpf_call_base as *const () as u64;
+                        // Single path: rewrite LD_IMM64 fake_fd→real_fd for
+                        // every map reference; leave BPF_CALL alone (the
+                        // verifier resolves helper ids during bpf_check).
+                        // The bypass-verifier path retired (goal item 5).
                         let mut idx = 0u32;
                         while idx < num_insns {
                             let insn = &mut *insns_base.add(idx as usize);
@@ -855,82 +672,28 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                 }
                                 if map_slot >= 0 {
                                     let j = map_slot as usize;
-                                    let map_ptr = (*bg).maps[j];
-                                    if use_verifier {
-                                        let real_fd = BIFROST_MAP_REAL_FDS[j];
-                                        if real_fd >= 0 {
-                                            insn.imm = real_fd;
-                                            // Keep src_reg=BPF_PSEUDO_MAP_FD(1) — the
-                                            // verifier flips this to MAP_VALUE/PTR
-                                            // and rewrites imm to the kernel addr.
-                                            if idx + 1 < num_insns {
-                                                let insn2 = &mut *insns_base.add((idx + 1) as usize);
-                                                insn2.imm = 0;
-                                            }
-                                            pr_info!(
-                                                "bifrost_guest: layer2 ldimm64[{}] fake_fd={} -> real_fd={}\n",
-                                                idx, fake_fd, real_fd
-                                            );
-                                        }
-                                    } else if !map_ptr.is_null() {
-                                        let addr = map_ptr as u64;
-                                        insn.imm = addr as i32;
-                                        insn.set_src_reg(0);
+                                    let real_fd = BIFROST_MAP_REAL_FDS[j];
+                                    if real_fd >= 0 {
+                                        insn.imm = real_fd;
+                                        // Keep src_reg=BPF_PSEUDO_MAP_FD(1) — the
+                                        // verifier flips this to MAP_VALUE/PTR
+                                        // and rewrites imm to the kernel addr.
                                         if idx + 1 < num_insns {
                                             let insn2 = &mut *insns_base.add((idx + 1) as usize);
-                                            insn2.imm = (addr >> 32) as i32;
+                                            insn2.imm = 0;
                                         }
-                                        pr_info!(
-                                            "bifrost_guest: patched insn[{}] fd={} -> map=0x{:x}\n",
-                                            idx, fake_fd, addr
-                                        );
                                     }
                                 }
                                 idx += 2;
                                 continue;
                             }
 
-                            if insn.code == 0x85 && insn.src_reg() == 0 {
-                                let helper_id = insn.imm;
-                                if use_verifier {
-                                    // Verifier resolves helper ids; leave
-                                    // imm alone (it already holds the id).
-                                    let _ = helper_id;
-                                } else {
-                                    let helper_addr: u64 = match helper_id {
-                                        67 => bifrost_get_stack as *const () as u64,
-                                        _ => {
-                                            // Bypass-verifier path — `prog` not yet constructed.
-                                            // Safe to pass NULL because all helpers we lower in
-                                            // this path live in bpf_base_func_proto's first
-                                            // switch (no CAP_BPF gate).
-                                            let proto = bindings::bifrost_get_func_proto(
-                                                helper_id as bindings::bpf_func_id,
-                                                core::ptr::null(),
-                                            );
-                                            if proto.is_null() {
-                                                0
-                                            } else {
-                                                (*proto).func.map(|f| f as *const () as u64).unwrap_or(0)
-                                            }
-                                        }
-                                    };
-                                    if helper_addr != 0 {
-                                        let offset = helper_addr.wrapping_sub(bpf_call_base) as i32;
-                                        insn.imm = offset;
-                                        pr_info!(
-                                            "bifrost_guest: patched insn[{}] helper {} -> 0x{:x} (offset {})\n",
-                                            idx, helper_id, helper_addr, offset
-                                        );
-                                    } else {
-                                        pr_err!("bifrost_guest: no proto for helper {}\n", helper_id);
-                                    }
-                                }
-                            }
+                            // BPF_CALL (0x85): verifier-resolved.  Leave imm
+                            // alone; bpf_check rewrites it into a helper
+                            // dispatch during verification.
 
                             idx += 1;
                         }
-                        pr_info!("bifrost_guest: Phase 3 finished\n");
 
                         // --- Phase 3b (BFR7): kfunc reloc resolution ---
                         // Trailer after the insn array:
@@ -947,14 +710,26 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // happens here. Eliminates the BTF-mismatch bug
                         // class — there's no compile-time btf_id to
                         // mismatch against.
-                        let relocs_base = (insns_base as *const u8).add((num_insns as usize) * 8);
-                        let num_relocs = *(relocs_base as *const u32);
+                        // Reloc trailer offset comes from the parser; the
+                        // first 4 bytes there are `num_relocs` followed by
+                        // `num_relocs` × (u32 insn_idx, u8 name_len, name)
+                        // entries — all bounds-validated.
+                        let relocs_base = payload_base.add(layout.relocs_off);
+                        let num_relocs = layout.num_relocs;
                         let mut reloc_ok = true;
+                        // Threaded back to the host on failure (item 9
+                        // wire-format extension).
+                        let mut reloc_failure_detail: [u8; 256] = [0u8; 256];
+                        let mut reloc_failure_detail_len: usize = 0;
                         if num_relocs > 0 {
                             let vmlinux_btf = bindings::bpf_get_btf_vmlinux();
                             if vmlinux_btf.is_null() {
                                 pr_err!("bifrost_guest: bpf_get_btf_vmlinux returned NULL\n");
                                 reloc_ok = false;
+                                let msg = b"vmlinux BTF unavailable";
+                                let n = msg.len().min(reloc_failure_detail.len());
+                                reloc_failure_detail[..n].copy_from_slice(&msg[..n]);
+                                reloc_failure_detail_len = n;
                             } else {
                                 let mut walk = relocs_base.add(4);
                                 let mut name_buf = [0u8; 256];
@@ -1001,6 +776,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                             nm, btf_id
                                         );
                                         reloc_ok = false;
+                                        let copy = name_len.min(reloc_failure_detail.len());
+                                        reloc_failure_detail[..copy]
+                                            .copy_from_slice(&name_buf[..copy]);
+                                        reloc_failure_detail_len = copy;
                                         break;
                                     }
                                     let target_insn = &mut *insns_base.add(insn_idx);
@@ -1023,7 +802,12 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                     BIFROST_MAP_REAL_FDS[j] = -1;
                                 }
                             }
-                            complete_load_prog(bg, cmd, -(bindings::EINVAL as i32));
+                            complete_load_prog_with_detail(
+                                bg,
+                                cmd,
+                                -(bindings::EINVAL as i32),
+                                &reloc_failure_detail[..reloc_failure_detail_len],
+                            );
                             continue;
                         }
                         if num_relocs > 0 {
@@ -1045,12 +829,15 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // when wired through Phase B step 3.
                         if let Err(e) = slots_ensure(slot + 1) {
                             pr_err!(
-                                "bifrost_guest: slot table grow to len={} failed ({:?}); dropping LOAD_PROG\n",
-                                slot + 1,
+                                "bifrost_guest: slot {} exceeds pre-allocated MAX_PROBE_SLOTS table ({:?}); dropping LOAD_PROG\n",
+                                slot,
                                 e
                             );
                             // Re-arm and continue without registering anything.
-                            complete_load_prog(bg, cmd, -(bindings::ENOMEM as i32));
+                            // Surface -ENOSPC so the host CLI's preflight bug
+                            // reports show a slot-cap diagnostic, not a generic
+                            // ENOMEM.
+                            complete_load_prog(bg, cmd, -(bindings::ENOSPC as i32));
                             continue;
                         }
 
@@ -1062,13 +849,9 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             (*prog).type_ = 2; // BPF_PROG_TYPE_KPROBE (UNSPEC=0, SOCKET_FILTER=1, KPROBE=2)
                             (*prog).set_jit_requested(1);
                             (*prog).set_gpl_compatible(1);
-                            if !use_verifier && !(*prog).aux.is_null() {
-                                // Bypass path needs stack_depth set manually
-                                // since the verifier (which would normally
-                                // compute it) is skipped. See memory note
-                                // build_jit_stack_depth.md.
-                                (*(*prog).aux).stack_depth = 512;
-                            }
+                            // Verifier computes aux->stack_depth during
+                            // bpf_check; the manual override the bypass path
+                            // needed is gone.
 
                             let dst = &mut (*prog).__bindgen_anon_1 as *mut _ as *mut u8;
                             core::ptr::copy_nonoverlapping(
@@ -1177,35 +960,32 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             // calls, etc. May replace the prog pointer
                             // (extra_pass / blinding rewrites).
                             let mut prog_p: *mut bindings::bpf_prog = prog;
-                            if use_verifier {
-                                let verr = bindings::bifrost_verify_prog(&mut prog_p);
-                                if verr != 0 {
-                                    pr_err!(
-                                        "bifrost_guest: bifrost_verify_prog failed: {}\n",
-                                        verr
-                                    );
-                                    bpf_prog_free(prog_p);
-                                    for j in 0..(*bg).num_maps as usize {
-                                        let f = BIFROST_MAP_REAL_FDS[j];
-                                        if f >= 0 {
-                                            let _ = bindings::close_fd(f as core::ffi::c_uint);
-                                            BIFROST_MAP_REAL_FDS[j] = -1;
-                                        }
-                                    }
-                                    complete_load_prog(bg, cmd, verr);
-                                    continue;
-                                }
-                                pr_info!("bifrost_guest: bifrost_verify_prog ok\n");
-                                // Release the real fds — the prog now holds
-                                // a kernel-pointer reference to each map
-                                // (and bifrost_map_get_fd took a uref the
-                                // close releases).
+                            let verr = bindings::bifrost_verify_prog(&mut prog_p);
+                            if verr != 0 {
+                                pr_err!(
+                                    "bifrost_guest: bifrost_verify_prog failed: {}\n",
+                                    verr
+                                );
+                                bpf_prog_free(prog_p);
                                 for j in 0..(*bg).num_maps as usize {
                                     let f = BIFROST_MAP_REAL_FDS[j];
                                     if f >= 0 {
                                         let _ = bindings::close_fd(f as core::ffi::c_uint);
                                         BIFROST_MAP_REAL_FDS[j] = -1;
                                     }
+                                }
+                                complete_load_prog(bg, cmd, verr);
+                                continue;
+                            }
+                            // Release the real fds — the prog now holds a
+                            // kernel-pointer reference to each map (and
+                            // bifrost_map_get_fd took a uref the close
+                            // releases).
+                            for j in 0..(*bg).num_maps as usize {
+                                let f = BIFROST_MAP_REAL_FDS[j];
+                                if f >= 0 {
+                                    let _ = bindings::close_fd(f as core::ffi::c_uint);
+                                    BIFROST_MAP_REAL_FDS[j] = -1;
                                 }
                             }
 
@@ -1272,7 +1052,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                 uprobe_basename: &uprobe_basename[..uprobe_basename_len],
                                 uprobe_symbol: &uprobe_symbol[..uprobe_symbol_len],
                                 uprobe_provider: &uprobe_provider[..uprobe_provider_len],
-                                uprobe_path_buf: &uprobe_path_buf,
+                                uprobe_path_buf,
                                 uprobe_file_offset,
                             };
                             let attach_status = slot_family_attach(slot, probe_type, bg, &ext);
@@ -1587,18 +1367,38 @@ extern "C" fn bifrost_probe(vdev: *mut bindings::virtio_device) -> c_int {
 extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
     unsafe {
         let bg = (*vdev).priv_ as *mut BifrostGuest;
+
+        // Goal item 7: teardown ordering.  The contract is that no
+        // freed memory can be observed by an in-flight BPF program
+        // or kfunc reader.  We achieve this with a strict sequence:
+        //
+        //   1.  Stop the worker thread (no new LOAD_PROGs land).
+        //   2.  Unregister every probe (uprobe, fbt, tracepoint) so
+        //       no new BPF program invocations happen.  The uprobe
+        //       family runs a batched `uprobe_unregister_sync` after
+        //       the loop — that drains every in-flight handler.
+        //   3.  Clear the helper globals (doorbell fn, SHMEM va/len)
+        //       so any straggler kfunc reader sees NULL and no-ops.
+        //       The C-side WRITE_ONCE+smp_wmb pattern means readers
+        //       can't observe a half-cleared fn pointer + private
+        //       data combination.
+        //   4.  synchronize_rcu — wait for any RCU-read-side critical
+        //       section that was in flight before step 3 to complete.
+        //       BPF programs run under RCU; this is the belt-and-
+        //       suspenders bound on residual readers.
+        //   5.  Free the JIT'd BPF programs (atomic swap-out on every
+        //       slot's prog pointer).
+        //   6.  Free maps, virtqueues, buffers, SHMEM, BifrostGuest.
+        //
+        // Steps 1, 2, 4 form the "no more readers" boundary; steps
+        // 3, 5, 6 destroy what those readers used to observe.
+
+        // Step 1: stop the LOAD_PROG worker before doing anything else.
         if !(*bg).thread.is_null() {
             bindings::kthread_stop((*bg).thread);
         }
-        bifrost_clear_doorbell_callback();
-        bifrost_clear_shmem_ringbuf();
 
-        // Unregister all probes first (before freeing memory they reference).
-        // Per-slot teardown lives in `cleanup_slot_*` helpers above; this
-        // loop just dispatches by probe_type.  Uprobe slots accumulate a
-        // had_uprobe flag so we can run a single batched
-        // `uprobe_unregister_sync()` at the end (drains outstanding
-        // handlers across the whole module before bpf_prog_free).
+        // Step 2: unregister probes + drain handlers.
         if (*bg).kprobe_attached {
             // Phase D: single cleanup dispatch.  USDT shares the
             // uprobe storage with the by-sym and host-resolved
@@ -1615,12 +1415,27 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
             (*bg).kprobe_attached = false;
             BIFROST_NUM_KPROBES = 0;
         }
-        // Free BPF programs in all loaded slots. Atomic swap avoids
-        // racing the per-slot probe handler (uprobe consumer / fbt
-        // trampoline / raw tracepoint dispatch) if it ever fires
-        // after the unregister call but before the bpf_prog_free.
-        // Walk the actual KVec length (== SLOT_CAPACITY by construction
-        // in bifrost_slots_init) rather than the legacy MAX_KPROBES
+
+        // Step 3: clear helper globals so any residual reader (a
+        // BPF program that started before step 2's unregister drained)
+        // sees NULL and no-ops instead of touching about-to-be-freed
+        // memory. Ordering inside each clear is enforced C-side
+        // (fn pointer cleared before private data; SHMEM va cleared
+        // before len) via WRITE_ONCE + smp_wmb.
+        bifrost_clear_doorbell_callback();
+        bifrost_clear_shmem_ringbuf();
+
+        // Step 4: drain residual RCU readers.  After this returns,
+        // every BPF program that began executing before step 3 has
+        // either completed or has progressed past every READ_ONCE
+        // load of the cleared globals.
+        bindings::synchronize_rcu();
+
+        // Step 5: free JIT'd BPF programs.  Atomic swap avoids any
+        // theoretical race against a probe handler that somehow
+        // outran the synchronize_rcu (defense in depth).  Walks the
+        // actual KVec length (== SLOT_CAPACITY by construction in
+        // bifrost_slots_init) rather than the legacy MAX_KPROBES
         // const, so a future grow-on-demand changes one site only.
         let cap = slots_mut().len();
         for s in 0..cap {
@@ -1630,9 +1445,9 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
             }
         }
 
-        // Free all bpf_maps. Every map (RINGBUF included) was allocated
-        // via bifrost_alloc_map; the kernel owns the storage and the
-        // per-type free vector is in map.ops.
+        // Step 6: free all bpf_maps. Every map (RINGBUF included) was
+        // allocated via bifrost_alloc_map; the kernel owns the storage
+        // and the per-type free vector is in map.ops.
         for i in 0..(*bg).num_maps as usize {
             if !(*bg).maps[i].is_null() {
                 bindings::bifrost_free_map((*bg).maps[i]);
@@ -1680,14 +1495,16 @@ impl kernel::Module for BifrostGuestModule {
     fn init(_module: &'static kernel::ThisModule) -> Result<Self> {
         pr_info!("bifrost_guest: Rust module initialized\n");
         kfunc_manifest::validate()?;
-        // Phase C heap migration: allocate the slot table before
-        // any virtio probe path can touch it.  ~80 KB kmalloc;
-        // OOM here aborts module load with an actionable -ENOMEM
-        // rather than the silent crash a NULL access would
-        // produce later.
+        // Phase L (goal item 4): allocate the slot table full at module
+        // load.  The KVec is never resized past init, so the slice
+        // header that IRQ-context uprobe handlers index against is
+        // stable.  ~80 KB kmalloc; OOM here aborts module load with an
+        // actionable -ENOMEM rather than the silent crash a NULL access
+        // would produce later.  Slots beyond the cap are refused with
+        // -ENOSPC, not silently truncated.
         bifrost_slots_init()?;
         pr_info!(
-            "bifrost_guest: slot table heap-backed (initial={} slots, grows on demand via slots_ensure; was [BifrostSlot; MAX_KPROBES=8] static array)\n",
+            "bifrost_guest: slot table pre-allocated ({} slots; fixed-size, no runtime grow)\n",
             INITIAL_SLOT_HINT
         );
         unsafe {
