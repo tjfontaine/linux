@@ -8,8 +8,18 @@ use crate::bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_T
 use crate::record_writer::RecordWriter;
 use crate::wire::{
     AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_STDDEV, AGG_SNAPSHOT_PROBE_ID,
+    SHMEM_DROP_CLASS_AGG,
 };
 use crate::{BifrostGuest, BIFROST_MAP_AGG_KIND, BIFROST_MAP_FAKE_FDS};
+
+extern "C" {
+    /// W7: class-aware kernel-internal reserve. Mirrors
+    /// `bifrost_shmem_reserve_kernel` but attributes drops to the
+    /// caller-supplied class so the host CLI can report which
+    /// workload class (PRINCIPAL / AGG / STKSTR / DBLERR) is
+    /// overloaded.
+    fn bifrost_shmem_reserve_kernel_class(size: u32, class: u32) -> *mut c_void;
+}
 
 /// Pack a snapshot of every non-RINGBUF map's live entries into the
 /// SHMEM event ringbuf. Replaces the legacy VQ_EVENT op=6
@@ -31,7 +41,8 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
         const MAX_ENTRIES: usize = 960;
         const MAX_BODY: usize = HDR_BYTES + NUM_ENTRIES_BYTES + MAX_ENTRIES * MAX_ENTRY_BYTES;
 
-        let rec = bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
+        let rec = bifrost_shmem_reserve_kernel_class(MAX_BODY as u32, SHMEM_DROP_CLASS_AGG)
+            as *mut u8;
         if rec.is_null() {
             return;
         }

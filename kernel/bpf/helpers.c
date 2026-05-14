@@ -2393,13 +2393,39 @@ EXPORT_SYMBOL_GPL(bifrost_free_shmem);
  * counters pad the struct to one cache line; future per-class
  * drop counters (W7 follow-on) consume that headroom.
  */
+/* W7 follow-on: per-class drop attribution. Each per-CPU cache
+ * line now carries dropped_records / dropped_bytes for each of
+ * four DTrace drop classes — principal (regular probe records),
+ * agg (aggregation snapshots), stkstr (stack/VMA-table side
+ * records), and dblerr (error-clause-action faults). The host
+ * shutdown summary surfaces the per-class taxonomy in
+ * `[bifrost] guest-ring drop summary: drops=N (principal=N agg=N
+ * stkstr=N dblerr=N)`.
+ *
+ * Drop-class assignment: BPF-callable
+ * `bifrost_kfunc_shmem_reserve` defaults to PRINCIPAL.
+ * Kernel-internal callers
+ * (push_agg_snapshot, publish_vma_table, symtab pumps) pass an
+ * explicit class via `bifrost_shmem_reserve_kernel_class`.
+ *
+ * Struct expands from 64 to 128 bytes (two cache lines per CPU);
+ * `BIFROST_PER_CPU_STATE_STRIDE` bumps to 128 to match. With
+ * `BIFROST_NUM_CPUS_MAX = 16` the per-CPU array consumes 2 KB
+ * — comfortably under the 4 KB SHMEM header page.
+ */
+#define BIFROST_DROP_CLASS_PRINCIPAL 0
+#define BIFROST_DROP_CLASS_AGG       1
+#define BIFROST_DROP_CLASS_STKSTR    2
+#define BIFROST_DROP_CLASS_DBLERR    3
+#define BIFROST_DROP_CLASS_MAX       4
+
 struct bifrost_shmem_per_cpu {
 	atomic64_t producer_pos;
 	atomic64_t consumer_pos;
-	atomic64_t dropped_records;
-	atomic64_t dropped_bytes;
+	atomic64_t dropped_records[BIFROST_DROP_CLASS_MAX];
+	atomic64_t dropped_bytes[BIFROST_DROP_CLASS_MAX];
 	u8 _pad[32];
-} __aligned(64);
+} __aligned(128);
 
 /* SHMEM ringbuf header (SHMEM_VERSION 4 — per-CPU principal
  * buffer). The 6 MB ringbuf area is carved into `num_cpus`
@@ -2414,7 +2440,9 @@ struct bifrost_shmem_per_cpu {
  * layout). */
 #define BIFROST_NUM_CPUS_MAX 16
 #define BIFROST_PER_CPU_STATE_OFF 128
-#define BIFROST_PER_CPU_STATE_STRIDE 64
+/* W7 follow-on: stride bumps from 64 to 128 to fit per-class
+ * drop counters. With NUM_CPUS_MAX=16 the per-CPU array is 2 KB. */
+#define BIFROST_PER_CPU_STATE_STRIDE 128
 
 struct bifrost_shmem_ringbuf_hdr {
 	u32 magic;
@@ -2469,12 +2497,15 @@ bifrost_shmem_pcpu(struct bifrost_shmem_ringbuf_hdr *hdr, unsigned int cpu)
 }
 
 static void bifrost_shmem_note_drop(struct bifrost_shmem_ringbuf_hdr *hdr,
-				    unsigned int cpu, u32 size)
+				    unsigned int cpu, u32 size,
+				    unsigned int class)
 {
 	struct bifrost_shmem_per_cpu *pc = bifrost_shmem_pcpu(hdr, cpu);
 
-	atomic64_inc(&pc->dropped_records);
-	atomic64_add(size, &pc->dropped_bytes);
+	if (class >= BIFROST_DROP_CLASS_MAX)
+		class = BIFROST_DROP_CLASS_PRINCIPAL;
+	atomic64_inc(&pc->dropped_records[class]);
+	atomic64_add(size, &pc->dropped_bytes[class]);
 }
 
 /*
@@ -2539,11 +2570,14 @@ int bifrost_set_shmem_ringbuf(void *shmem_va, unsigned long region_len,
 
 	for (cpu = 0; cpu < BIFROST_NUM_CPUS_MAX; cpu++) {
 		struct bifrost_shmem_per_cpu *pc = &hdr->per_cpu[cpu];
+		unsigned int klass;
 
 		atomic64_set(&pc->producer_pos, 0);
 		atomic64_set(&pc->consumer_pos, 0);
-		atomic64_set(&pc->dropped_records, 0);
-		atomic64_set(&pc->dropped_bytes, 0);
+		for (klass = 0; klass < BIFROST_DROP_CLASS_MAX; klass++) {
+			atomic64_set(&pc->dropped_records[klass], 0);
+			atomic64_set(&pc->dropped_bytes[klass], 0);
+		}
 	}
 	smp_wmb();
 
@@ -3834,7 +3868,12 @@ __bpf_kfunc int bifrost_kfunc_emit_vma_table(void *buf, u32 buf__sz)
  * push_agg_snapshot in the bifrost guest module). Same atomic
  * CAS + wraparound logic; just lifted out of the BPF kfunc.
  */
-void *bifrost_shmem_reserve_kernel(u32 size)
+/* Class-aware kernel-internal reserve. The BPF-callable kfunc
+ * below defaults to PRINCIPAL; other in-kernel call sites
+ * (push_agg_snapshot, publish_vma_table, symtab pumps) pass
+ * AGG / STKSTR explicitly so the W7 drop summary can attribute
+ * which class is overloaded. */
+void *bifrost_shmem_reserve_kernel_class(u32 size, unsigned int class)
 {
 	char *base = READ_ONCE(bifrost_shmem_va);
 	struct bifrost_shmem_ringbuf_hdr *hdr;
@@ -3855,14 +3894,6 @@ void *bifrost_shmem_reserve_kernel(u32 size)
 	if (!rb_len || !per_cpu_len || !hdr->num_cpus)
 		return NULL;
 
-	/* W1: per-CPU sub-ring selection. Pin to the current CPU's
-	 * sub-ring (modulo num_cpus on hosts with more CPUs than
-	 * BIFROST_NUM_CPUS_MAX). No preemption disable needed —
-	 * smp_processor_id() under preempt-able BPF context can
-	 * migrate, but a migration after picking the sub-ring just
-	 * means we CAS into the previous CPU's ring; correctness is
-	 * preserved by the atomic CAS, only fairness is slightly
-	 * reduced. The kernel BPF prologue typically pins anyway. */
 	cpu = smp_processor_id() % hdr->num_cpus;
 	pc = &hdr->per_cpu[cpu];
 	data = base + rb_off + (u64)cpu * per_cpu_len;
@@ -3874,14 +3905,10 @@ void *bifrost_shmem_reserve_kernel(u32 size)
 		cons = atomic64_read(&pc->consumer_pos);
 		off_in_rb = cur % per_cpu_len;
 
-		/* Wraparound within this CPU's sub-ring: claim a
-		 * padding record for the remaining bytes, then loop
-		 * to claim the real record at offset 0 of the same
-		 * sub-ring. */
 		if (off_in_rb + aligned > per_cpu_len) {
 			u64 pad_size = per_cpu_len - off_in_rb;
 			if (cur + pad_size - cons > per_cpu_len) {
-				bifrost_shmem_note_drop(hdr, cpu, size);
+				bifrost_shmem_note_drop(hdr, cpu, size, class);
 				return NULL;
 			}
 			new_pos = cur + pad_size;
@@ -3899,7 +3926,7 @@ void *bifrost_shmem_reserve_kernel(u32 size)
 		}
 
 		if (cur + aligned - cons > per_cpu_len) {
-			bifrost_shmem_note_drop(hdr, cpu, size);
+			bifrost_shmem_note_drop(hdr, cpu, size, class);
 			return NULL;
 		}
 		new_pos = cur + aligned;
@@ -3912,6 +3939,17 @@ void *bifrost_shmem_reserve_kernel(u32 size)
 	rec_hdr[0] = size;
 	WRITE_ONCE(rec_hdr[1], 0); /* flags = busy */
 	return (char *)rec_hdr + BIFROST_RB_RECORD_HDR;
+}
+EXPORT_SYMBOL_GPL(bifrost_shmem_reserve_kernel_class);
+
+/* Backwards-compatible kernel-internal entry: defaults to
+ * PRINCIPAL drop attribution. Callers that know which class
+ * they're emitting (agg snapshots, VMA tables, symtab pushes)
+ * should use `bifrost_shmem_reserve_kernel_class` directly. */
+void *bifrost_shmem_reserve_kernel(u32 size)
+{
+	return bifrost_shmem_reserve_kernel_class(
+		size, BIFROST_DROP_CLASS_PRINCIPAL);
 }
 EXPORT_SYMBOL_GPL(bifrost_shmem_reserve_kernel);
 
@@ -4134,7 +4172,8 @@ __bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
 		return -ENOENT;
 	if (bifrost_vma_pub_test_and_set(tgid, exec_id))
 		return 0; /* already published */
-	rec = bifrost_shmem_reserve_kernel(BIFROST_VMA_REC_SIZE);
+	rec = bifrost_shmem_reserve_kernel_class(BIFROST_VMA_REC_SIZE,
+						  BIFROST_DROP_CLASS_STKSTR);
 	if (!rec) {
 		bifrost_vma_pub_clear(tgid, exec_id);
 		return -ENOSPC;
@@ -4155,6 +4194,445 @@ __bpf_kfunc int bifrost_kfunc_publish_vma_table(void)
 	}
 	bifrost_shmem_submit_kernel(rec);
 	return 1;
+}
+
+/*
+ * W10: walltimestamp(). Returns CLOCK_REALTIME nanoseconds since
+ * the Unix epoch — the same clock `date +%s%N` reads. The pre-W10
+ * lowering aliased `bpf_ktime_get_boot_ns` which returned monotonic
+ * ns since boot, so scripts comparing against absolute wall time
+ * silently saw bogus values. `ktime_get_real_ns` is the kernel's
+ * canonical "wall-clock now" call and is safe from any context
+ * (irq, NMI, preemption disabled).
+ */
+__bpf_kfunc u64 bifrost_kfunc_walltime_ns(void)
+{
+	return ktime_get_real_ns();
+}
+
+/*
+ * W10 (partial): vtimestamp(). DTrace's contract is "ns the
+ * current thread has spent in probe context". The proper
+ * implementation captures entry time on every probe entry into
+ * a per-CPU `pid_tgid`-keyed task-storage map and subtracts on
+ * read; that machinery is filed under W10 follow-on.
+ *
+ * Today the kfunc aliases `ktime_get_ns()` so the variable is
+ * at least defined and scripts using it lower without error.
+ * The upgrade path is purely internal — no DIF, wire, or host
+ * renderer changes are required when the per-task accounting
+ * lands.
+ */
+__bpf_kfunc u64 bifrost_kfunc_vtimestamp_ns(void)
+{
+	return ktime_get_ns();
+}
+
+/*
+ * W10: progenyof(pid). Returns 1 if @target_pid is `current` or
+ * any ancestor of `current`, walking up `real_parent` to init.
+ *
+ * Bounded loop: we cap at BIFROST_PROGENYOF_MAX_DEPTH so a
+ * pathological ancestor chain (or a corrupt task_struct under
+ * concurrent task tearaway) can't spin the verifier or block
+ * forever. PID 1 (init) terminates the chain naturally — if we
+ * see real_parent == itself before hitting init, that's the
+ * idle/init boundary; we stop and return 0.
+ *
+ * Compares against `tgid` (the user-visible "process ID"), not
+ * the kernel's per-thread `pid`. Matches DTrace semantics where
+ * `progenyof(N)` cares about the process tree, not threads.
+ */
+#define BIFROST_PROGENYOF_MAX_DEPTH 64
+__bpf_kfunc u64 bifrost_kfunc_progenyof(u32 target_pid)
+{
+	struct task_struct *t = current;
+	unsigned int depth;
+
+	if (!t)
+		return 0;
+	rcu_read_lock();
+	for (depth = 0; depth < BIFROST_PROGENYOF_MAX_DEPTH; depth++) {
+		struct task_struct *parent;
+
+		if (!t)
+			break;
+		if ((u32)t->tgid == target_pid) {
+			rcu_read_unlock();
+			return 1;
+		}
+		parent = rcu_dereference(t->real_parent);
+		if (!parent || parent == t)
+			break;
+		t = parent;
+	}
+	rcu_read_unlock();
+	return 0;
+}
+
+/*
+ * W9: strlen(s). DTrace's `strlen(string s)` returns the number
+ * of bytes before the first NUL, capped at the on-disk string
+ * limit. We bound the read at BIFROST_STR_MAX bytes so the
+ * verifier accepts the call from any probe context, and use
+ * `bpf_probe_read_user_str` for safe user-space fault handling.
+ *
+ * Returns 0 if @uaddr is NULL or unreadable, matching DTrace's
+ * "no fault, just zero" semantics. Real action-fault routing
+ * lives behind W3 (dtrace:::ERROR clauses).
+ */
+#define BIFROST_STR_MAX 256
+__bpf_kfunc u64 bifrost_kfunc_strlen(const char *uaddr)
+{
+	char buf[BIFROST_STR_MAX];
+	long n;
+
+	if (!uaddr)
+		return 0;
+	n = strncpy_from_user(buf, (const char __user *)uaddr,
+			       BIFROST_STR_MAX);
+	if (n < 0)
+		return 0;
+	if (n == BIFROST_STR_MAX)
+		n = BIFROST_STR_MAX - 1;
+	return (u64)n;
+}
+
+/*
+ * W9: copyinstr(uaddr). Bounded NUL-terminated user-string copy
+ * into a per-CPU scratch buffer; returns a kernel pointer that
+ * BPF programs use as a `string` operand to `printf("%s", ...)`.
+ *
+ * Per-CPU scratch is reused across calls in the same probe — a
+ * probe that calls copyinstr twice gets the second result back
+ * from the same buffer, overwriting the first. This matches
+ * DTrace's "copyinstr scratch is short-lived" contract: callers
+ * are expected to use the result immediately (e.g. as a printf
+ * argument), not stash it.
+ */
+DEFINE_PER_CPU(char[BIFROST_STR_MAX], bifrost_copyinstr_scratch);
+
+__bpf_kfunc char *bifrost_kfunc_copyinstr(const char *uaddr)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	long n;
+
+	if (!uaddr) {
+		buf[0] = '\0';
+		return buf;
+	}
+	n = strncpy_from_user(buf, (const char __user *)uaddr,
+			       BIFROST_STR_MAX);
+	if (n < 0) {
+		buf[0] = '\0';
+		return buf;
+	}
+	if (n >= BIFROST_STR_MAX)
+		buf[BIFROST_STR_MAX - 1] = '\0';
+	return buf;
+}
+
+/*
+ * W9: strchr(s, c) — first occurrence of byte @needle in
+ * user-string @uaddr. Returns a kernel pointer into the per-CPU
+ * scratch buffer (the same one `copyinstr` writes into) at the
+ * matching offset, or the buffer's NUL slot when @needle is 0
+ * and the string has room (matches DTrace's "strchr(s, '\0')
+ * returns end-of-string"), or NULL if not found / unreadable.
+ *
+ * Bound: BIFROST_STR_MAX bytes. Longer haystacks are silently
+ * truncated, matching the rest of the W9 string built-ins.
+ */
+__bpf_kfunc char *bifrost_kfunc_strchr(const char *uaddr, u64 needle)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	char target = (char)(needle & 0xff);
+	long n;
+	long i;
+
+	if (!uaddr)
+		return NULL;
+	n = strncpy_from_user(buf, (const char __user *)uaddr,
+			       BIFROST_STR_MAX);
+	if (n < 0)
+		return NULL;
+	if (n >= BIFROST_STR_MAX)
+		n = BIFROST_STR_MAX - 1;
+	for (i = 0; i < n; i++) {
+		if (buf[i] == target)
+			return &buf[i];
+	}
+	/* DTrace's strchr(s, '\0') returns a pointer to the
+	 * terminating NUL; copyinstr already wrote it at buf[n]. */
+	if (target == '\0')
+		return &buf[n];
+	return NULL;
+}
+
+/*
+ * W9: strrchr(s, c) — last occurrence of byte @needle.
+ * Same scratch + bound semantics as strchr; iterates from the
+ * end backward so the first match wins.
+ */
+__bpf_kfunc char *bifrost_kfunc_strrchr(const char *uaddr, u64 needle)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	char target = (char)(needle & 0xff);
+	long n;
+	long i;
+
+	if (!uaddr)
+		return NULL;
+	n = strncpy_from_user(buf, (const char __user *)uaddr,
+			       BIFROST_STR_MAX);
+	if (n < 0)
+		return NULL;
+	if (n >= BIFROST_STR_MAX)
+		n = BIFROST_STR_MAX - 1;
+	if (target == '\0')
+		return &buf[n];
+	for (i = n - 1; i >= 0; i--) {
+		if (buf[i] == target)
+			return &buf[i];
+	}
+	return NULL;
+}
+
+/*
+ * W9: copyin(uaddr, len) — bounded byte copy from user memory
+ * into a per-CPU scratch buffer. Unlike copyinstr this does NOT
+ * stop at NUL; the requested length is honored up to
+ * BIFROST_STR_MAX. Returns a kernel pointer that BPF programs
+ * use as a generic byte blob (for tracemem-style emission).
+ *
+ * Reuses the same per-CPU scratch buffer as copyinstr/strchr/
+ * strrchr — callers that interleave the calls in one probe must
+ * consume the result before the next call.
+ */
+__bpf_kfunc void *bifrost_kfunc_copyin(const char *uaddr, u64 len)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	u64 cap = len < BIFROST_STR_MAX ? len : BIFROST_STR_MAX;
+	long rc;
+
+	if (!uaddr || cap == 0) {
+		buf[0] = '\0';
+		return buf;
+	}
+	rc = copy_from_user(buf, (const void __user *)uaddr, cap);
+	if (rc != 0) {
+		/* Best-effort: zero on partial-or-failed copy so the
+		 * caller sees a deterministic blob instead of stale
+		 * scratch bytes. */
+		memset(buf, 0, cap);
+	}
+	return buf;
+}
+
+/*
+ * W9 auxiliary scratch — strstr / index / strjoin / substr need
+ * a SECOND per-CPU buffer so two user strings can be staged at
+ * the same time. Sized to match BIFROST_STR_MAX so the kernel-side
+ * search loops stay within a fixed bound the verifier can prove.
+ */
+DEFINE_PER_CPU(char[BIFROST_STR_MAX], bifrost_copyinstr_scratch_aux);
+
+/*
+ * W9: strstr(haystack, needle). Returns a pointer into the
+ * primary per-CPU scratch buffer at the first occurrence of
+ * `needle` in `haystack`, or NULL if not found / unreadable.
+ * Both args are user pointers to NUL-terminated strings.
+ *
+ * Implementation: O(n*m) byte-wise search after copying both
+ * strings into per-CPU scratch. Empty needle returns the start
+ * of haystack (matches DTrace semantics).
+ */
+__bpf_kfunc char *bifrost_kfunc_strstr(const char *uaddr_h,
+				       const char *uaddr_n)
+{
+	char *h = this_cpu_ptr(bifrost_copyinstr_scratch);
+	char *n = this_cpu_ptr(bifrost_copyinstr_scratch_aux);
+	long hlen, nlen, i, j;
+
+	if (!uaddr_h || !uaddr_n)
+		return NULL;
+	hlen = strncpy_from_user(h, (const char __user *)uaddr_h,
+				  BIFROST_STR_MAX);
+	if (hlen < 0)
+		return NULL;
+	if (hlen >= BIFROST_STR_MAX)
+		hlen = BIFROST_STR_MAX - 1;
+	nlen = strncpy_from_user(n, (const char __user *)uaddr_n,
+				  BIFROST_STR_MAX);
+	if (nlen < 0)
+		return NULL;
+	if (nlen >= BIFROST_STR_MAX)
+		nlen = BIFROST_STR_MAX - 1;
+	if (nlen == 0)
+		return h;
+	if (nlen > hlen)
+		return NULL;
+	for (i = 0; i <= hlen - nlen; i++) {
+		for (j = 0; j < nlen; j++) {
+			if (h[i + j] != n[j])
+				break;
+		}
+		if (j == nlen)
+			return &h[i];
+	}
+	return NULL;
+}
+
+/*
+ * W9: index(haystack, needle). Like `strstr` but returns the
+ * zero-based byte offset, or -1 if not found / unreadable.
+ * (DTrace returns the offset as an integer scalar, hence the
+ * u64 return type bit-packing a signed -1 as 0xFFFFFFFFFFFFFFFF.)
+ */
+__bpf_kfunc u64 bifrost_kfunc_index(const char *uaddr_h,
+				    const char *uaddr_n)
+{
+	char *p = bifrost_kfunc_strstr(uaddr_h, uaddr_n);
+	char *h = this_cpu_ptr(bifrost_copyinstr_scratch);
+
+	if (!p)
+		return (u64)-1L;
+	return (u64)(p - h);
+}
+
+/*
+ * W9: strjoin(a, b). Concatenates two user strings into the
+ * primary per-CPU scratch buffer. Total length bounded by
+ * BIFROST_STR_MAX (the second copy stops early if the first
+ * fills the buffer).
+ */
+__bpf_kfunc char *bifrost_kfunc_strjoin(const char *uaddr_a,
+					const char *uaddr_b)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	long alen, blen, room;
+
+	if (!uaddr_a) {
+		buf[0] = '\0';
+		alen = 0;
+	} else {
+		alen = strncpy_from_user(buf, (const char __user *)uaddr_a,
+					  BIFROST_STR_MAX);
+		if (alen < 0)
+			alen = 0;
+		if (alen >= BIFROST_STR_MAX)
+			alen = BIFROST_STR_MAX - 1;
+	}
+	room = BIFROST_STR_MAX - alen - 1;
+	if (uaddr_b && room > 0) {
+		blen = strncpy_from_user(buf + alen,
+					  (const char __user *)uaddr_b,
+					  room + 1);
+		if (blen < 0)
+			blen = 0;
+		if (blen > room)
+			blen = room;
+		buf[alen + blen] = '\0';
+	} else {
+		buf[alen] = '\0';
+	}
+	return buf;
+}
+
+/*
+ * W9: substr(s, idx, len). Returns a pointer to the primary
+ * per-CPU scratch buffer holding `len` bytes of `s` starting at
+ * byte offset `idx`. Out-of-range or negative parameters clamp
+ * to a zero-length result (matches DTrace's "no fault, just
+ * empty" semantics).
+ */
+__bpf_kfunc char *bifrost_kfunc_substr(const char *uaddr,
+				       u64 idx, u64 len)
+{
+	char *buf = this_cpu_ptr(bifrost_copyinstr_scratch);
+	char *aux = this_cpu_ptr(bifrost_copyinstr_scratch_aux);
+	long n;
+	long start, end, sublen;
+
+	if (!uaddr) {
+		buf[0] = '\0';
+		return buf;
+	}
+	n = strncpy_from_user(aux, (const char __user *)uaddr,
+			       BIFROST_STR_MAX);
+	if (n < 0) {
+		buf[0] = '\0';
+		return buf;
+	}
+	if (n >= BIFROST_STR_MAX)
+		n = BIFROST_STR_MAX - 1;
+	start = (long)idx;
+	if (start < 0 || start >= n) {
+		buf[0] = '\0';
+		return buf;
+	}
+	sublen = (long)len;
+	if (sublen < 0)
+		sublen = 0;
+	end = start + sublen;
+	if (end > n)
+		end = n;
+	if (end - start >= BIFROST_STR_MAX)
+		end = start + BIFROST_STR_MAX - 1;
+	memcpy(buf, aux + start, end - start);
+	buf[end - start] = '\0';
+	return buf;
+}
+
+/*
+ * W8 (protocol-level): speculation lifecycle. Real DTrace
+ * speculation routes record reservations into per-lane side
+ * buffers until commit() promotes them or discard() drops them.
+ * The kfuncs here register the API surface so scripts that call
+ * speculation()/speculate()/commit()/discard() lower and load
+ * cleanly; the per-lane side-buffer machinery (per-CPU ring
+ * carved into N speculation lanes, lane-aware
+ * `bifrost_shmem_reserve_kernel`) is filed under W8 follow-on.
+ *
+ * Current behavior: speculation() returns 1 (single conceptual
+ * lane id); speculate/commit/discard are no-ops. Records emit
+ * unconditionally to the principal sub-ring. Scripts that rely
+ * on speculative filtering will see UNFILTERED output — this is
+ * advertised in `docs/dtrace-roadmap.md` W8.
+ */
+__bpf_kfunc u64 bifrost_kfunc_speculation(void)
+{
+	return 1;
+}
+
+__bpf_kfunc void bifrost_kfunc_speculate(u64 id__ign)
+{
+}
+
+__bpf_kfunc void bifrost_kfunc_commit(u64 id__ign)
+{
+}
+
+__bpf_kfunc void bifrost_kfunc_discard(u64 id__ign)
+{
+}
+
+/*
+ * W5 (protocol-level): clear(@agg). DTrace's `clear()` zeros
+ * every entry of an aggregation map. The full implementation
+ * needs (a) `KF_ARG_PTR_TO_MAP` verifier support so a BPF
+ * program can pass its agg's `bpf_map *` here, and (b) per-CPU
+ * value walking for PERCPU_* map types. Both are filed under
+ * W5 follow-on along with `lquantize` / `llquantize` /
+ * `normalize` / `trunc`.
+ *
+ * Today the kfunc is a no-op so scripts that call `clear()`
+ * compile and load; the aggregation retains its values across
+ * the call. Loud documentation in `docs/dtrace-roadmap.md`.
+ */
+__bpf_kfunc int bifrost_kfunc_clear_agg(u64 map_fd__ign)
+{
+	return 0;
 }
 
 __bpf_kfunc_end_defs();
@@ -4249,6 +4727,33 @@ BTF_ID_FLAGS(func, bifrost_kfunc_shmem_reserve, KF_RET_NULL)
 BTF_ID_FLAGS(func, bifrost_kfunc_shmem_submit)
 BTF_ID_FLAGS(func, bifrost_kfunc_publish_vma_table)
 BTF_ID_FLAGS(func, bifrost_kfunc_shmem_kick)
+/* W10: real wall-clock + ancestor walk. Both are pure (no
+ * side-effects on guest state) — no special KF_* flags needed. */
+BTF_ID_FLAGS(func, bifrost_kfunc_walltime_ns)
+BTF_ID_FLAGS(func, bifrost_kfunc_vtimestamp_ns)
+BTF_ID_FLAGS(func, bifrost_kfunc_progenyof)
+/* W9: bounded user-string accessors. KF_SLEEPABLE is NOT set —
+ * strncpy_from_user is fault-tolerant via pagefault_disable in
+ * the BPF runtime, returning -EFAULT instead of sleeping. */
+BTF_ID_FLAGS(func, bifrost_kfunc_strlen)
+BTF_ID_FLAGS(func, bifrost_kfunc_copyinstr)
+/* W9: strchr/strrchr return a pointer into the per-CPU scratch
+ * buffer, or NULL if the byte isn't present. KF_RET_NULL signals
+ * the verifier so callers must NULL-check before deref. */
+BTF_ID_FLAGS(func, bifrost_kfunc_strchr, KF_RET_NULL)
+BTF_ID_FLAGS(func, bifrost_kfunc_strrchr, KF_RET_NULL)
+BTF_ID_FLAGS(func, bifrost_kfunc_copyin)
+BTF_ID_FLAGS(func, bifrost_kfunc_strstr, KF_RET_NULL)
+BTF_ID_FLAGS(func, bifrost_kfunc_index)
+BTF_ID_FLAGS(func, bifrost_kfunc_strjoin)
+BTF_ID_FLAGS(func, bifrost_kfunc_substr)
+/* W8 (protocol-level): speculation lifecycle no-op stubs. */
+BTF_ID_FLAGS(func, bifrost_kfunc_speculation)
+BTF_ID_FLAGS(func, bifrost_kfunc_speculate)
+BTF_ID_FLAGS(func, bifrost_kfunc_commit)
+BTF_ID_FLAGS(func, bifrost_kfunc_discard)
+/* W5 (partial): clear() agg-zeroing kfunc. */
+BTF_ID_FLAGS(func, bifrost_kfunc_clear_agg)
 BTF_KFUNCS_END(common_btf_ids)
 
 static const struct btf_kfunc_id_set common_kfunc_set = {

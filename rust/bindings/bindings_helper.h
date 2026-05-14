@@ -87,6 +87,13 @@ extern int bifrost_set_doorbell_callback(bifrost_kick_fn_t fn, void *priv);
  * through BPF. Same atomic CAS + wraparound semantics as the BPF
  * kfunc form `bifrost_kfunc_shmem_reserve`. */
 extern void *bifrost_shmem_reserve_kernel(unsigned int size);
+/* W7: class-aware variant. `class` is one of BIFROST_DROP_CLASS_*
+ * (PRINCIPAL=0, AGG=1, STKSTR=2, DBLERR=3); on reserve failure the
+ * per-class drop counters are bumped so the host CLI can attribute
+ * which workload class is overloaded. The bare _kernel form above
+ * defaults to PRINCIPAL. */
+extern void *bifrost_shmem_reserve_kernel_class(unsigned int size,
+					         unsigned int class);
 extern void bifrost_shmem_submit_kernel(void *ptr);
 /* Bifrost task lookup by tgid. Returns NULL if no such task; caller
  * must put_task_struct via bifrost_put_task. */

@@ -6,7 +6,7 @@ use kernel::ffi::{c_int, c_void};
 use kernel::prelude::*;
 
 use crate::record_writer::RecordWriter;
-use crate::wire::SYM_TABLE_PROBE_MAGIC;
+use crate::wire::{SHMEM_DROP_CLASS_STKSTR, SYM_TABLE_PROBE_MAGIC};
 
 extern "C" {
     /// C helper: pack the ELF function-symbol table of `file` into
@@ -18,6 +18,11 @@ extern "C" {
         sym_idx_start: u32,
         sym_idx_next: *mut u32,
     ) -> c_int;
+
+    /// W7: class-aware reserve. Symtab pushes attribute drops to
+    /// the STKSTR class so the host can see when symbolication
+    /// metadata is starving the ring.
+    fn bifrost_shmem_reserve_kernel_class(size: u32, class: u32) -> *mut c_void;
 }
 
 /// Trampoline used by `bifrost_helper_for_each_vma_file`'s callback hook.
@@ -48,7 +53,8 @@ unsafe fn push_symtab_snapshot(file: *mut bindings::file) {
     unsafe {
         let mut sym_idx: u32 = 0;
         for chunk in 0..MAX_CHUNKS {
-            let rec = bindings::bifrost_shmem_reserve_kernel(MAX_BODY as u32) as *mut u8;
+            let rec = bifrost_shmem_reserve_kernel_class(MAX_BODY as u32, SHMEM_DROP_CLASS_STKSTR)
+                as *mut u8;
             if rec.is_null() {
                 return;
             }

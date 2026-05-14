@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 298055b368127bfb5a724afdb27abc55e0f0aff91d8c881dfda7df630010125e
+// CANONICAL_SHA256: 1cd208e55e46653e6693daaa3817e9af1045e3886084c90f98f4b580fa704994
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -636,12 +636,17 @@ pub const HELLO_REJECT_OTHER: u8 = 99;
 /// sees the same memory. ASCII `BFSH` interpreted as little-endian.
 pub const SHMEM_MAGIC: u32 = 0x48534642;
 /// Layout version stored next to `SHMEM_MAGIC`. Bump when the SHMEM
-/// header layout changes incompatibly. V4 introduces the per-CPU
-/// principal buffer carve (W1 in `docs/dtrace-roadmap.md`):
-/// the 6 MB ring is split into `SHMEM_NUM_CPUS_MAX` sub-rings of
-/// `per_cpu_ring_len` each, with one cache line of producer /
-/// consumer / drop state per CPU at offset 128.
-pub const SHMEM_VERSION: u32 = 4;
+/// header layout changes incompatibly.
+///
+/// - V4 introduces the per-CPU principal buffer carve (W1 in
+///   `docs/dtrace-roadmap.md`): the 6 MB ring is split into
+///   `SHMEM_NUM_CPUS_MAX` sub-rings of `per_cpu_ring_len` each,
+///   with one cache line of producer / consumer / drop state
+///   per CPU at offset 128.
+/// - V5 widens each per-CPU state entry from 64 B to 128 B to
+///   carry per-class drop arrays (W7, `SHMEM_DROP_CLASS_*`)
+///   indexed by PRINCIPAL / AGG / STKSTR / DBLERR.
+pub const SHMEM_VERSION: u32 = 5;
 /// Cap on per-CPU sub-rings. Hosts with more CPUs than the cap
 /// share a sub-ring (`smp_processor_id() % num_cpus` selection
 /// at reserve time). Cross-layer drift pinned in
@@ -652,8 +657,21 @@ pub const SHMEM_NUM_CPUS_MAX: u32 = 16;
 /// Byte offset of the per-CPU state array within the SHMEM
 /// header page. Each entry is one cache line.
 pub const SHMEM_PER_CPU_STATE_OFF: u32 = 128;
-/// Stride between successive CPU state entries (one cache line).
-pub const SHMEM_PER_CPU_STATE_STRIDE: u32 = 64;
+/// Stride between successive CPU state entries. V5 widens this
+/// from 64 to 128 bytes to fit the per-class drop arrays.
+pub const SHMEM_PER_CPU_STATE_STRIDE: u32 = 128;
+
+/// W7 drop-class identifiers. Indexes into the per-CPU
+/// `dropped_records` / `dropped_bytes` arrays added at SHMEM
+/// V5. The host CLI uses these to attribute which workload
+/// class (principal event records, aggregation snapshots,
+/// stack/symtab metadata, or double-fault ERROR clauses) is
+/// overflowing its sub-ring.
+pub const SHMEM_DROP_CLASS_PRINCIPAL: u32 = 0;
+pub const SHMEM_DROP_CLASS_AGG: u32 = 1;
+pub const SHMEM_DROP_CLASS_STKSTR: u32 = 2;
+pub const SHMEM_DROP_CLASS_DBLERR: u32 = 3;
+pub const SHMEM_DROP_CLASS_MAX: u32 = 4;
 /// 8-byte record header: u32 size, u32 flags.
 pub const SHMEM_RECORD_HDR_SIZE: usize = 8;
 pub const SHMEM_RECORD_FLAG_READY: u32 = 1;
