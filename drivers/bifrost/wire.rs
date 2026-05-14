@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 1cd208e55e46653e6693daaa3817e9af1045e3886084c90f98f4b580fa704994
+// CANONICAL_SHA256: f565fc5b5adac79d7882abd84eab80f94304e651b3a4878267b3303ba2d3babf
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -154,6 +154,18 @@ pub const AGG_KIND_AVG: u8 = 3;
 /// renderer can compute
 /// `sqrt((sum_sq * n - sum*sum) / (n * (n-1)))` at render time.
 pub const AGG_KIND_STDDEV: u8 = 4;
+/// `lquantize()` aggregation (W5b). Linear-bucket histogram —
+/// per-CPU slot is a single u64 bucket counter; map is a
+/// PERCPU_ARRAY of 64 buckets keyed on `bucket_id: u32`.  Bucket
+/// boundaries (`base`, `step`, `levels`) live in
+/// `xagg::LquantizeParams` registered at clause-parse time and
+/// applied at render time.
+pub const AGG_KIND_LQUANTIZE: u8 = 5;
+/// `llquantize()` aggregation (W5c). Log-linear-bucket
+/// histogram — map shape matches `AGG_KIND_LQUANTIZE`; bucket
+/// boundaries (`factor`, `low_mag`, `high_mag`,
+/// `steps_per_mag`) live in `xagg::LlquantizeParams`.
+pub const AGG_KIND_LLQUANTIZE: u8 = 6;
 
 // =====================================================================
 // SHMEM record probe-id magics.  Stored at offset 4 of every
