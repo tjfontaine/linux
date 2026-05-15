@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: f565fc5b5adac79d7882abd84eab80f94304e651b3a4878267b3303ba2d3babf
+// CANONICAL_SHA256: a236d7ac9cc1ec9475f038b8466b721e22dab4b6e2caa76c11128aedadd42b34
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -87,12 +87,21 @@ pub const LOAD_PROG_BATCH_MAGIC_LE: u32 = u32::from_le_bytes(*b"BLP3");
 /// allocated but never registered.  No live probe ever takes this
 /// value.
 pub const PROBE_TYPE_NONE: u8 = 0xff;
-// PROBE_TYPE_KPROBE (0) and PROBE_TYPE_KRETPROBE (1) retired:
-// kprobe int3 attach is no longer the canonical kernel-function
-// probe shape in bifrost — fbt (FENTRY/FEXIT trampoline) covers
-// regular functions and tracepoints (PROBE_TYPE_TRACEPOINT)
-// reach the notrace-marked targets that kprobe used to.  The
-// wire-format slots 0/1 are gone with the dispatch arms.
+// PROBE_TYPE_KPROBE (0) and PROBE_TYPE_KRETPROBE (1) retired from
+// the kernel-side dispatch: kprobe int3 attach is no longer the
+// canonical kernel-function probe shape in bifrost — fbt
+// (FENTRY/FEXIT trampoline) covers regular functions and
+// tracepoints (PROBE_TYPE_TRACEPOINT) reach the notrace-marked
+// targets that kprobe used to.
+//
+// Wire-format compatibility: the codec in `codec.rs` and the
+// `wrapper_golden.rs` test fixtures still accept probe_type 0/1
+// with an empty trailer. This is *decode-only compatibility* so
+// older recorded BFR7 wrappers (and the canonical minimal golden)
+// remain parseable; no live host path produces a 0/1 wrapper and
+// the kernel has no dispatch arm for them. Treat 0/1 the same way
+// you would treat any retired-but-grandfathered enum value: do
+// not introduce new producers.
 pub const PROBE_TYPE_UPROBE: u8 = 2;
 pub const PROBE_TYPE_URETPROBE: u8 = 3;
 /// Kernel-resolved uprobes: the host CLI sends just (basename,
