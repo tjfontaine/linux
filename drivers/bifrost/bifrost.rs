@@ -1513,9 +1513,18 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
     }
 }
 
-static mut ID_TABLE: [bindings::virtio_device_id; 2] = [
+static mut ID_TABLE: [bindings::virtio_device_id; 3] = [
     bindings::virtio_device_id {
         device: 42,
+        vendor: bindings::VIRTIO_DEV_ANY_ID,
+    },
+    // QEMU's stock vhost-user-test-device validates the virtio ID through
+    // its built-in virtio_id_to_name() table before the backend ever sees the
+    // device. Bind a QEMU-known generic ID for that path so Bifrost stays a
+    // guest/backend change instead of a QEMU patch. This kernel config does
+    // not enable a competing virtio-spi driver.
+    bindings::virtio_device_id {
+        device: 45,
         vendor: bindings::VIRTIO_DEV_ANY_ID,
     },
     bindings::virtio_device_id {
