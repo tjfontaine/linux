@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 16e98621d4c8c0e44946c87d0d15bbbb3da3a581bb375fcd2037f0a7e9ffac0e
+// CANONICAL_SHA256: 89e11231c6fd7b175f763cd72bbfe3d03beed7461420d0e10e64ce344593f284
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -239,6 +239,42 @@ pub const VMA_TABLE_PROBE_ID: u32 = 0xFFFFFFFF;
 
 /// Aggregation-snapshot record.
 pub const AGG_SNAPSHOT_PROBE_ID: u32 = 0xFFFFFFFD;
+
+// =====================================================================
+// AGG_SNAPSHOT schema versioning + per-row kind discriminant.
+//
+// Schema v1 stamps a `dtbar_action`-equivalent byte into every per-
+// entry row so the host no longer has to infer the aggregation kind
+// from a regex over the user's D source (the
+// `cli::agg_decl` scanner).  The schema version lives in the
+// previously-reserved u64 at sub-header offset 16.
+//
+// Kernel writers (FreeBSD `bifrost_conduit_publish_agg_snapshot`,
+// Linux `agg_snapshot::push_agg_snapshot`) translate their internal
+// action discriminants to these stable wire values.  The host's
+// `cli::orchestrate::ingest_agg_snapshot` detects the schema and
+// dispatches accordingly.
+// =====================================================================
+
+/// Schema version stamped at AGG_SNAPSHOT sub-header offset 16.
+///   v0 = legacy per-row `{ fd, k_size, key, v_size, value }`
+///   v1 = per-row `{ fd, kind, reserved[3], k_size, key, v_size, value }`
+pub const AGG_SNAPSHOT_SCHEMA_V0: u64 = 0;
+pub const AGG_SNAPSHOT_SCHEMA_V1: u64 = 1;
+
+/// Per-row kind discriminant for schema v1+.  Stable across kernels
+/// — both the FreeBSD bridge and the Linux agg snapshotter
+/// translate to these values when writing the wire.
+pub const AGG_SNAPSHOT_ROW_KIND_UNKNOWN: u8 = 0;
+pub const AGG_SNAPSHOT_ROW_KIND_COUNT: u8 = 1;
+pub const AGG_SNAPSHOT_ROW_KIND_SUM: u8 = 2;
+pub const AGG_SNAPSHOT_ROW_KIND_MIN: u8 = 3;
+pub const AGG_SNAPSHOT_ROW_KIND_MAX: u8 = 4;
+pub const AGG_SNAPSHOT_ROW_KIND_AVG: u8 = 5;
+pub const AGG_SNAPSHOT_ROW_KIND_STDDEV: u8 = 6;
+pub const AGG_SNAPSHOT_ROW_KIND_QUANTIZE: u8 = 7;
+pub const AGG_SNAPSHOT_ROW_KIND_LQUANTIZE: u8 = 8;
+pub const AGG_SNAPSHOT_ROW_KIND_LLQUANTIZE: u8 = 9;
 
 /// Per-binary function-symbol-table push from the guest's
 /// uprobe-register path.  See drivers/bifrost/bifrost_helpers.c
