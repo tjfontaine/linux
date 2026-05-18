@@ -148,7 +148,12 @@ pub(crate) unsafe fn complete_load_prog_with_detail(
     detail: &[u8],
 ) {
     unsafe {
-        if !cmd.is_null() && (*cmd).op == 2 {
+        // op == 2 → legacy LOAD_PROG; op == 3 → post-cutover
+        // DTRACE_SESSION envelope. Both reply with the same
+        // `[i32 status][u16 detail_len][detail]` shape on the rsp
+        // ring so the host's existing `decode_load_prog_status` path
+        // works for either.
+        if !cmd.is_null() && ((*cmd).op == 2 || (*cmd).op == 3) {
             let seq = load_prog_seq(cmd, (*bg).cmd_len);
             send_load_prog_status(bg, seq, status, detail);
         }

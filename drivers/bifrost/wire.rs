@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: b5678f968750b7b6fd4c20d75a0a6d703bbb0686b3b093480bd81c9dd903ee76
+// CANONICAL_SHA256: 4d350fac9e8caef4abe1edf5c9e8648f006d92e9a4f29861f815cefcda7de6da
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
