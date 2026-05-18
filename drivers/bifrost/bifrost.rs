@@ -261,7 +261,7 @@ pub(crate) static mut BIFROST_MAP_AGG_KIND: [u8; 8] = [0; 8];
 /// release them after verification — the prog holds its own ref.
 static mut BIFROST_MAP_REAL_FDS: [i32; 8] = [-1; 8];
 
-// Bypass-verifier path retired (Phase L, goal item 5). Every LOAD_PROG
+// Bypass-verifier path retired. Every LOAD_PROG
 // routes through `bifrost_verify_prog` against the standard kernel BPF
 // verifier — no toggle, no module_param. The historical AtomicBool flag
 // and its `__bpf_call_base + offset` patch arm are gone; the kernel
@@ -273,7 +273,7 @@ static mut BIFROST_MAP_REAL_FDS: [i32; 8] = [-1; 8];
 // manual `aux->stack_depth = 512` set (bpf_check computes the real
 // frame size).
 
-/// SINGLETON DEVICE INVARIANT (goal item 10).
+/// SINGLETON DEVICE INVARIANT.
 ///
 /// The bifrost helper surface — `bifrost_shmem_va`/`bifrost_shmem_len`,
 /// `bifrost_kick_fn`/`bifrost_kick_priv` in kernel/bpf/helpers.c, plus
@@ -698,7 +698,7 @@ extern "C" {
 
 // RecordWriter moved to drivers/bifrost/record_writer.rs.
 
-// `bifrost_get_stack` shim retired (Phase L, goal item 5). With the
+// `bifrost_get_stack` shim retired. With the
 // bypass-verifier path gone, helper id 67 resolves to the kernel's real
 // `bpf_get_stack_proto` via `kprobe_prog_func_proto` during bpf_check.
 // That path handles BPF_F_USER_STACK and kprobe/kretprobe context
@@ -715,8 +715,8 @@ extern "C" {
 #[inline(always)]
 pub(crate) unsafe fn run_prog_slot(slot: usize, regs: *mut bindings::pt_regs) {
     unsafe {
-        // Bounds-check against the slot-table length.  Post-Phase-L
-        // (goal item 4) the table is pre-allocated full at module
+        // Bounds-check against the slot-table length.  The
+        // table is pre-allocated full at module
         // init and never reallocated, so the slice header observed
         // from IRQ context is stable.  This check is defense in
         // depth against a stale or out-of-bounds slot index arriving
@@ -845,7 +845,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
 	                if (*bg).cmd_len >= core::mem::size_of::<BifrostCmd>() as u32 {
 	                    if (*cmd).op == 3 {
 	                        // BifrostCmd.op == 3 — DTRACE_SESSION envelope
-	                        // (post-cutover; see goal.md + the
+	                        // (post-cutover; see the
 	                        // BIFROST_CMD_OP_DTRACE_SESSION host doc).
 	                        // Body: BifrostCmd hdr + 96-byte
 	                        // DTRACE_SESSION_V1 + DOF.  This stub
@@ -1217,7 +1217,7 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                         // Single path: rewrite LD_IMM64 fake_fd→real_fd for
                         // every map reference; leave BPF_CALL alone (the
                         // verifier resolves helper ids during bpf_check).
-                        // The bypass-verifier path retired (goal item 5).
+                        // The bypass-verifier path retired.
                         let mut idx = 0u32;
                         while idx < num_insns {
                             let insn = BpfInsn::read_le_unaligned(insn_at(idx));
@@ -1394,14 +1394,14 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
 
                         // --- Phase 4: Allocate bpf_prog and JIT into slot N ---
                         let slot = BIFROST_NUM_KPROBES;
-                        // Phase C heap migration: grow the slot
+                        // Heap migration: grow the slot
                         // table on demand instead of bouncing off
                         // a hard MAX_KPROBES cap.  Allocation
                         // failure (kmalloc returns -ENOMEM) re-arms
                         // ctrl_buf with status=-1 — the host CLI's
                         // existing per-program status path will
                         // surface this as RSP_LOADPROG_STATUS_OTHER
-                        // when wired through Phase B step 3.
+                        // when wired through the BTF resolution step.
                         if let Err(e) = slots_ensure(slot + 1) {
                             pr_err!(
                                 "bifrost_guest: slot {} exceeds pre-allocated MAX_PROBE_SLOTS table ({:?}); dropping LOAD_PROG\n",
@@ -1530,8 +1530,8 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                 }
                             }
 
-                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER,
-                            // Track B P0 #6): the BPF program runs from a
+                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER):
+                            // the BPF program runs from a
                             // perf_event sample callback, so route through
                             // bifrost_set_prog_type(BPF_PROG_TYPE_PERF_EVENT)
                             // before the verifier sees it.  No
@@ -1639,10 +1639,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             let name_slice = &target_name[..nul];
                             let name_str = core::str::from_utf8(name_slice).unwrap_or("?");
 
-                            // Phase D: single dispatch site collapses
+                            // Single dispatch site collapses
                             // the five-arm match into one helper.  The
                             // helper also issues a fresh slot lease
-                            // (Phase C step 2 kernel-side) before
+                            // (the kernel-side heap migration) before
                             // dispatching to the family-specific
                             // attach.
                             let ext = AttachExt {
@@ -1967,7 +1967,7 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
     unsafe {
         let bg = (*vdev).priv_ as *mut BifrostGuest;
 
-        // Goal item 7: teardown ordering.  The contract is that no
+        // Teardown ordering.  The contract is that no
         // freed memory can be observed by an in-flight BPF program
         // or kfunc reader.  We achieve this with a strict sequence:
         //
@@ -1999,7 +1999,7 @@ extern "C" fn bifrost_remove(vdev: *mut bindings::virtio_device) {
 
         // Step 2: unregister probes + drain handlers.
         if (*bg).kprobe_attached {
-            // Phase D: single cleanup dispatch.  USDT shares the
+            // Single cleanup dispatch.  USDT shares the
             // uprobe storage with the by-sym and host-resolved
             // variants; slot_family_cleanup returns true for any
             // uprobe-family slot so the caller can run the
@@ -2103,7 +2103,7 @@ impl kernel::Module for BifrostGuestModule {
     fn init(_module: &'static kernel::ThisModule) -> Result<Self> {
         pr_info!("bifrost_guest: Rust module initialized\n");
         kfunc_manifest::validate()?;
-        // Phase L (goal item 4): allocate the slot table full at module
+        // Allocate the slot table full at module
         // load.  The KVec is never resized past init, so the slice
         // header that IRQ-context uprobe handlers index against is
         // stable.  ~80 KB kmalloc; OOM here aborts module load with an

@@ -1129,7 +1129,7 @@ void bifrost_helper_for_each_vma_file(struct task_struct *task,
 EXPORT_SYMBOL_GPL(bifrost_helper_for_each_vma_file);
 
 /*
- * Phase K — kfunc manifest.  Names and canonical C signatures of
+ * kfunc manifest.  Names and canonical C signatures of
  * every bifrost_helper_* exported from this file, in the same order
  * that the Rust extern decls appear in drivers/bifrost/bifrost.rs.
  *

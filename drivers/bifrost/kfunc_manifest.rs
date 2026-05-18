@@ -4,7 +4,7 @@
 use kernel::bindings;
 use kernel::prelude::*;
 
-// Phase K — kfunc manifest expected on the C side.  Each entry is
+// kfunc manifest expected on the C side.  Each entry is
 // (name, canonical_signature_string).  bifrost_helpers.c carries the
 // identical list as `BIFROST_KFUNC_MANIFEST`; module init validates
 // they match by computing the same djb2 hash on both sides.
@@ -55,7 +55,7 @@ const BIFROST_KFUNC_EXPECTED_HASH: u32 = bifrost_kfunc_expected_hash();
 const BIFROST_KFUNC_EXPECTED_LEN: u32 = BIFROST_KFUNC_EXPECTED.len() as u32;
 
 extern "C" {
-    /// Phase K — manifest hash exported by bifrost_helpers.c.  Mismatch
+    /// Manifest hash exported by bifrost_helpers.c.  Mismatch
     /// vs `BIFROST_KFUNC_EXPECTED_HASH` ⇒ Rust extern decls disagree
     /// with the live C signatures; refuse module load.
     fn bifrost_kfunc_manifest_hash() -> u32;
@@ -66,7 +66,7 @@ extern "C" {
 }
 
 pub(crate) fn validate() -> Result<()> {
-    // Phase K — kfunc manifest validation.  Refuses to load if
+    // kfunc manifest validation.  Refuses to load if
     // bifrost_helpers.c's exported manifest disagrees with the
     // Rust extern decls' expected manifest.  Two checks: array
     // length first (clearer diagnostic on add/remove drift),

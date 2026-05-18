@@ -284,7 +284,7 @@ pub(crate) unsafe fn parse_load_prog(
                 off += probe_len;
             }
             PROBE_TYPE_PROFILE_TIMER => {
-                // Track B P0 #6: trailer is one u64 period_ns.  We
+                // Trailer is one u64 period_ns.  We
                 // stash it in `uprobe_file_offset` (the only u64
                 // scratch field on `layout` today) so the attach
                 // dispatch can pass it through `AttachExt` without

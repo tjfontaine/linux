@@ -121,7 +121,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
             let kind = agg_snapshot_row_kind(agg_kind);
             let ok = match agg_kind {
                 AGG_KIND_QUANTIZE => {
-                    // Track B P0 #7: walk the per-CPU
+                    // Walk the per-CPU
                     // QUANTIZE_VALUE_SIZE byte bucket array, sum
                     // bucket-wise across CPUs, and emit ONE row
                     // with the full array as the value.  Matches
@@ -229,7 +229,7 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
                     }
                     let k32: u32 = k;
                     let k_bytes = k32.to_le_bytes();
-                    // Track B P0 #7: AGG_KIND_QUANTIZE on a
+                    // AGG_KIND_QUANTIZE on a
                     // PERCPU_ARRAY[1] represents an unkeyed
                     // `@latency = quantize(...)`.  The map index
                     // 0 is an internal lookup detail, not a

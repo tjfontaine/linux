@@ -10,7 +10,7 @@ use crate::wire::{MAX_PROBE_SLOTS, PROBE_TYPE_NONE};
 
 /// Slot-table capacity allocated at module init.
 ///
-/// **Phase L (goal item 4)**: the slot table is now allocated full at
+/// The slot table is now allocated full at
 /// init time rather than growing on demand.  `KVec<KBox<BifrostSlot>>`
 /// remains the underlying storage, but `KVec::push` is no longer
 /// called past `bifrost_slots_init()`.  This closes the IRQ-vs-worker

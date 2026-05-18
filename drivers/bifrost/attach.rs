@@ -222,7 +222,7 @@ pub(crate) unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
 }
 
 /// Short string label for the family that owns `probe_type`.
-/// Used by Phase H emit in a follow-up; today only diagnostic.
+/// Used by self-trace emit in a follow-up; today only diagnostic.
 #[allow(dead_code)]
 fn slot_family_label(probe_type: u8) -> &'static str {
     match probe_type {
@@ -237,7 +237,7 @@ fn slot_family_label(probe_type: u8) -> &'static str {
     }
 }
 
-/// Profile-timer attach (Track B P0 #6).  Opens a single per-CPU
+/// Profile-timer attach.  Opens a single per-CPU
 /// (CPU 0 for the MVP) `perf_event` of type PERF_TYPE_SOFTWARE
 /// (1) / PERF_COUNT_SW_CPU_CLOCK (0) with the host-supplied
 /// `period_ns` sample period, then attaches the JIT'd BPF program
@@ -547,7 +547,7 @@ unsafe fn attach_slot_uprobe_by_sym(
             );
             return -(bindings::EINVAL as i32);
         }
-        // Goal item 6: TaskRef pairs the C-side get_task_struct with a
+        // TaskRef pairs the C-side get_task_struct with a
         // mechanical put_task_struct on drop. Replaces the manual
         // put_task_ref calls that were scattered across each early
         // return.
@@ -781,7 +781,7 @@ unsafe fn attach_slot_usdt(
             }
             (None, pinned)
         } else {
-            // Goal item 6: TaskRef RAII pairs get_task_struct on the C
+            // TaskRef RAII pairs get_task_struct on the C
             // side with put_task_struct on drop.
             let Some(task_ref) = TaskRef::find(basename) else {
                 pr_err!(
@@ -937,7 +937,7 @@ unsafe fn attach_slot_uprobe(
         let mut resolved_via = "<unset>";
 
         // Stage 1: exe_file via for_each_process.
-        // Goal item 6: TaskRef releases the task ref on drop, even
+        // TaskRef releases the task ref on drop, even
         // through the early-break branches inside the chain below.
         let basename = path_basename(uprobe_path_buf);
         if !basename.is_empty() {

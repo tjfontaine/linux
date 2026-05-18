@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 4d350fac9e8caef4abe1edf5c9e8648f006d92e9a4f29861f815cefcda7de6da
+// CANONICAL_SHA256: ca5f1a2c1f7fe51da32efebf2a2eaabdfa3aeebcd55477f35b1e0ab3918d67d8
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -172,7 +172,7 @@ pub const PROBE_TYPE_FEXIT: u8 = 7;
 pub const PROBE_TYPE_TRACEPOINT: u8 = 8;
 /// Soft cap on the number of probe slots the driver can register
 /// concurrently.  The driver's slot table is now a heap-allocated
-/// `KVec<BifrostSlot>` (Phase C heap migration); this constant is
+/// `KVec<BifrostSlot>` (the heap-allocated slot table); this constant is
 /// the initial capacity sized at module load.  Mirrors
 /// `SLOT_CAPACITY` in
 /// `third_party/linux-bifrost/drivers/bifrost/bifrost.rs`.
@@ -212,7 +212,7 @@ pub const PROBE_TYPE_USDT: u8 = 9;
 ///
 ///   u64 period_ns
 ///
-/// Track B P0 #6: needed for the one-shared-clause demo shape
+/// Needed for the one-shared-clause demo shape
 /// (`profile:::tick-100ms { @latency = quantize(...); }` routed to
 /// every kernel, no per-OS clause split).
 pub const PROBE_TYPE_PROFILE_TIMER: u8 = 10;
@@ -249,8 +249,8 @@ pub const AGG_KIND_LQUANTIZE: u8 = 5;
 /// (`factor`, `low_mag`, `high_mag`, `steps_per_mag`) live in
 /// `xagg::LlquantizeParams`.
 pub const AGG_KIND_LLQUANTIZE: u8 = 6;
-/// `quantize()` aggregation (power-of-two histogram).  Track B P0
-/// #7: map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
+/// `quantize()` aggregation (power-of-two histogram).
+/// Map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
 /// value=`DTRACE_QUANTIZE_NBUCKETS * sizeof(u64) = 1016` bytes.
 pub const AGG_KIND_QUANTIZE: u8 = 7;
 pub const DTRACE_QUANTIZE_NBUCKETS: usize = 127;
@@ -352,7 +352,7 @@ pub const SELF_TRACE_DRIVER_PROBE_ID: u32 = 0xFFFFFFFB;
 pub const SELF_TRACE_LIBKRUN_PROBE_ID: u32 = 0xFFFFFFFA;
 /// Self-trace event from the host CLI.
 pub const SELF_TRACE_CLI_PROBE_ID: u32 = 0xFFFFFFF9;
-/// Profile-N sampling probe (Phase M).  Records carry a periodic
+/// Profile-N sampling probe.  Records carry a periodic
 /// stack snapshot of the running vcpu, captured by libkrun on a
 /// timer interrupt rather than by an in-guest probe — that's the
 /// hypervisor's superpower.  Body wire format:
@@ -412,7 +412,7 @@ pub const SELF_FIELD_BOOL: u8 = 3;
 /// upward if a future event needs to ride a larger payload.
 pub const SELF_TRACE_MAX_BODY: usize = 4096;
 
-/// Profile-sample flag bits (Phase M).  Stored in the `flags` u32
+/// Profile-sample flag bits.  Stored in the `flags` u32
 /// of the per-sample header.  Allocate by appending; never reuse a
 /// bit position.
 ///
@@ -433,8 +433,8 @@ pub const PROFILE_SAMPLE_FLAG_STACK_TRUNCATED: u32 = 1 << 1;
 pub const PROFILE_SAMPLE_FLAG_STACK_INCOMPLETE: u32 = 1 << 2;
 
 // =====================================================================
-// BTF-CO-RE field relocations — Phase N (driver-VMM binding durability
-// across kernel versions).
+// BTF-CO-RE field relocations — driver-VMM binding durability
+// across kernel versions.
 //
 // Today bifrost reads kernel struct fields at hardcoded offsets that
 // match the bundled 6.12.76 kernel.  When upstream kernels shift a
@@ -461,7 +461,7 @@ pub const PROFILE_SAMPLE_FLAG_STACK_INCOMPLETE: u32 = 1 << 2;
 //   - `struct_name`         BTF type name to look up.
 //   - `field_name`          field within the struct.  Today: simple
 //                           name; nested paths like "mm.start_brk"
-//                           are a Phase N.2 extension.
+//                           are a future extension.
 // =====================================================================
 
 /// Patcher writes the resolved field offset (in bytes) into the
@@ -480,18 +480,18 @@ pub const FIELD_RELOC_EXISTS: u8 = 2;
 
 /// Maximum length of a struct or field name in a field-reloc record.
 /// 255 because `name_len` is encoded as `u8`; bumping to a wider
-/// length prefix would be a Phase N.2 wire change.
+/// length prefix would be a future wire change.
 pub const FIELD_RELOC_NAME_MAX: usize = 255;
 
 /// Per-program flag bit (in `BifrostProgramHeader::flags` bits 8..31)
 /// signaling that the program body carries a field-reloc section
 /// after the kfunc-relocs section.  Old decoders ignore the bit and
 /// stop after kfunc-relocs; new decoders read the field-reloc
-/// section.  Phase N.2 wires the body integration; this constant
+/// section.  A later change wires the body integration; this constant
 /// reserves the bit so the bit position is pinned now.
 pub const PROGRAM_FLAG_FIELD_RELOCS_PRESENT: u32 = 1 << 8;
 
-/// Maximum stack frames in a single profile-N sample (Phase M).
+/// Maximum stack frames in a single profile-N sample.
 /// Bounds the per-sample emit buffer at roughly 16 + 8*MAX bytes;
 /// the libkrun-side sampler walks the guest stack until it hits
 /// this cap or fails a frame-pointer dereference.  256 frames at
@@ -514,10 +514,10 @@ pub const D4_KIND_OBSERVER_DETACH: u32 = 3;
 /// OBSERVER_ATTACH, before the first LOAD_PROG.  Body is the codec
 /// output of `bifrost_wire::codec::encode_hello` —
 /// `[u32 wire_major][u32 wire_minor][u64 feature_bits][u16 num_fields]
-/// [fields...]`.  Phase I (the driver↔VMM binding spine):
+/// [fields...]`.  This is the driver↔VMM binding spine:
 /// `CANONICAL_SHA256` keeps catching exact wire-body drift; HELLO
 /// adds capability negotiation on top of that pin so optional record
-/// kinds (Phase H emit, future profile-N samples, future hyp:::
+/// kinds (self-trace emit, future profile-N samples, future hyp:::
 /// records) can be feature-gated rather than version-pinned.  Driver
 /// replies with `D4_KIND_OBSERVER_HELLO_ACK` carrying its own
 /// (wire_major, wire_minor, feature_bits) plus an `accepted` flag.
@@ -622,7 +622,7 @@ pub const D4_KIND_SELF_TRACE_PUSH: u32 = 105;
 ///
 /// `seq` echoes the original HELLO request's seq.
 pub const D4_KIND_OBSERVER_HELLO_ACK: u32 = 106;
-/// Unsolicited push from libkrun — one profile-N sample (Phase M).
+/// Unsolicited push from libkrun — one profile-N sample.
 /// Body is the codec output of
 /// `bifrost_wire::codec::encode_profile_sample`:
 /// `[u32 pid][u32 tid][u32 cpu_id][u32 flags][u32 num_frames]
@@ -675,7 +675,7 @@ pub const BIFROST_WIRE_MINOR: u32 = 0;
 //
 // Bits 0..15 reserved for "core protocol" features (handshake itself,
 // extensible record discipline).  Bits 16..31 for record-kind
-// capabilities (Phase H emit, LOADPROG_STATUS, etc).  Bits 32..47 for
+// capabilities (self-trace emit, LOADPROG_STATUS, etc).  Bits 32..47 for
 // future provider catalog (profile-N, stable proc:::, sched:::, io:::,
 // syscall:::).  Bits 48+ reserved.
 
@@ -691,13 +691,13 @@ pub const FEATURE_EXTENSIBLE_RECORDS: u64 = 1 << 1;
 
 /// The peer produces/consumes per-program LOAD_PROG status pushes
 /// (`D4_KIND_LOAD_PROG_STATUS`, codec-encoded via
-/// `encode_loadprog_status`).  Phase B.
+/// `encode_loadprog_status`).
 pub const FEATURE_LOADPROG_STATUS: u64 = 1 << 16;
 /// The peer produces/consumes structured self-trace events
-/// (`D4_KIND_SELF_TRACE_PUSH`).  Phase H.
+/// (`D4_KIND_SELF_TRACE_PUSH`).
 pub const FEATURE_SELF_TRACE_EMIT: u64 = 1 << 17;
 /// The peer produces/consumes USDT-shape probes
-/// (`PROBE_TYPE_USDT`).  Phase A.
+/// (`PROBE_TYPE_USDT`).
 pub const FEATURE_USDT: u64 = 1 << 18;
 /// The peer produces/consumes FBT-shape probes
 /// (`PROBE_TYPE_FENTRY/FEXIT`).
@@ -709,25 +709,25 @@ pub const FEATURE_RAWTP: u64 = 1 << 20;
 /// (`PROBE_TYPE_UPROBE_BY_SYM/URETPROBE_BY_SYM`).
 pub const FEATURE_UPROBE_BY_SYM: u64 = 1 << 21;
 /// The peer registers an explicit observer_id at HELLO time and
-/// supports concurrent observers fanned out per id (Phase J).
+/// supports concurrent observers fanned out per id.
 /// Today's libkrun does NOT advertise this — it's the forward
 /// commitment.  When a peer advertises this bit, every record on
 /// the rsp ring is keyed by observer_id and the slot table accepts
 /// non-overlapping LOAD_PROG ownership across observers.
 pub const FEATURE_MULTI_OBSERVER: u64 = 1 << 22;
 /// The peer produces/consumes timer-driven profile-N samples
-/// (`D4_KIND_PROFILE_SAMPLE`, `PROFILE_SAMPLE_PROBE_ID`).  Phase M
+/// (`D4_KIND_PROFILE_SAMPLE`, `PROFILE_SAMPLE_PROBE_ID`)
 /// — the hypervisor-only superpower.  When set on the libkrun side,
 /// the device runs a vcpu sampler at the negotiated frequency and
 /// pushes samples through the bifrost rsp ring.
 pub const FEATURE_PROFILE_N: u64 = 1 << 32;
-/// The peer produces/consumes BTF-CO-RE field relocations (Phase N).
+/// The peer produces/consumes BTF-CO-RE field relocations.
 /// When negotiated, BFR7 wrappers carry a per-program field-reloc
 /// section that the libkrun-side patcher resolves against guest BTF
 /// at LOAD_PROG time, replacing hardcoded struct field offsets with
 /// kernel-version-specific values.  Forward-looking; today's libkrun
-/// does NOT advertise this — Phase N.1 lays the codec, Phase N.2
-/// wires the patcher.
+/// does NOT advertise this — the codec is laid down ahead of the
+/// patcher that consumes it.
 pub const FEATURE_BTF_FIELD_RELOC: u64 = 1 << 33;
 
 /// Mask covering the features any current-generation peer is
@@ -754,8 +754,8 @@ pub const HELLO_REJECT_WIRE_MAJOR_MISMATCH: u8 = 1;
 /// (a HELLO field carrying `required_features: u64`).  CLI should
 /// either drop the requirement or refuse to attach.
 pub const HELLO_REJECT_MISSING_REQUIRED_FEATURE: u8 = 2;
-/// Driver is busy with another observer that hasn't yielded.  Phase J
-/// (multi-observer) eliminates this; today's slot table is 1-at-a-time.
+/// Driver is busy with another observer that hasn't yielded.
+/// Multi-observer support eliminates this; today's slot table is 1-at-a-time.
 pub const HELLO_REJECT_OBSERVER_BUSY: u8 = 3;
 /// Catch-all for failures the driver hasn't classified.  Use the
 /// reason field for diagnostic detail; allocate a new constant if
