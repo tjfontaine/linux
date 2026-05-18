@@ -7,10 +7,11 @@ use kernel::ffi::c_void;
 use crate::bpf_consts::{BPF_MAP_TYPE_ARRAY, BPF_MAP_TYPE_PERCPU_ARRAY, BPF_MAP_TYPE_RINGBUF};
 use crate::record_writer::RecordWriter;
 use crate::wire::{
-    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_STDDEV, AGG_SNAPSHOT_PROBE_ID,
-    AGG_SNAPSHOT_ROW_KIND_AVG, AGG_SNAPSHOT_ROW_KIND_MAX, AGG_SNAPSHOT_ROW_KIND_MIN,
-    AGG_SNAPSHOT_ROW_KIND_STDDEV, AGG_SNAPSHOT_ROW_KIND_SUM, AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
-    AGG_SNAPSHOT_SCHEMA_V1, SHMEM_DROP_CLASS_AGG,
+    AGG_KIND_AVG, AGG_KIND_MAX, AGG_KIND_MIN, AGG_KIND_QUANTIZE, AGG_KIND_STDDEV,
+    AGG_SNAPSHOT_PROBE_ID, AGG_SNAPSHOT_ROW_KIND_AVG, AGG_SNAPSHOT_ROW_KIND_MAX,
+    AGG_SNAPSHOT_ROW_KIND_MIN, AGG_SNAPSHOT_ROW_KIND_QUANTIZE, AGG_SNAPSHOT_ROW_KIND_STDDEV,
+    AGG_SNAPSHOT_ROW_KIND_SUM, AGG_SNAPSHOT_ROW_KIND_UNKNOWN, AGG_SNAPSHOT_SCHEMA_V1,
+    DTRACE_QUANTIZE_NBUCKETS, QUANTIZE_VALUE_SIZE, SHMEM_DROP_CLASS_AGG,
 };
 
 /// Translate the kernel-internal per-map agg-kind flag to the
@@ -29,6 +30,7 @@ fn agg_snapshot_row_kind(agg_kind_u8: u8) -> u8 {
         AGG_KIND_MAX => AGG_SNAPSHOT_ROW_KIND_MAX,
         AGG_KIND_AVG => AGG_SNAPSHOT_ROW_KIND_AVG,
         AGG_KIND_STDDEV => AGG_SNAPSHOT_ROW_KIND_STDDEV,
+        AGG_KIND_QUANTIZE => AGG_SNAPSHOT_ROW_KIND_QUANTIZE,
         _ => AGG_SNAPSHOT_ROW_KIND_UNKNOWN,
     }
 }
@@ -118,6 +120,43 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
             let chk = writer.off;
             let kind = agg_snapshot_row_kind(agg_kind);
             let ok = match agg_kind {
+                AGG_KIND_QUANTIZE => {
+                    // Track B P0 #7: walk the per-CPU
+                    // QUANTIZE_VALUE_SIZE byte bucket array, sum
+                    // bucket-wise across CPUs, and emit ONE row
+                    // with the full array as the value.  Matches
+                    // FreeBSD libdtrace's wire shape so the host's
+                    // CrossTargetAggReducer folds both kernels'
+                    // contributions into one histogram cell.
+                    let n = DTRACE_QUANTIZE_NBUCKETS;
+                    let mut buckets: [u64; DTRACE_QUANTIZE_NBUCKETS] =
+                        [0u64; DTRACE_QUANTIZE_NBUCKETS];
+                    let rc = bindings::bifrost_map_lookup_quantize_buckets(
+                        map,
+                        k_ptr,
+                        buckets.as_mut_ptr(),
+                        n as u32,
+                    );
+                    if rc != 0 {
+                        return false;
+                    }
+                    // Skip rows with no fires at all (saves wire
+                    // bytes when a quantize agg was declared but
+                    // the probe never matched on this CPU).
+                    let any = buckets.iter().any(|&v| v != 0);
+                    if !any {
+                        return false;
+                    }
+                    let mut wrote = writer.write_i32(fd)
+                        && writer.write_bytes(&[kind, 0, 0, 0])
+                        && writer.write_u32(k_size)
+                        && writer.write_bytes(k_bytes)
+                        && writer.write_u32(QUANTIZE_VALUE_SIZE);
+                    for i in 0..n {
+                        wrote = wrote && writer.write_u64(buckets[i]);
+                    }
+                    wrote
+                }
                 AGG_KIND_STDDEV => {
                     let mut n: u64 = 0;
                     let mut sum: u64 = 0;
@@ -190,14 +229,28 @@ pub(crate) unsafe fn push_agg_snapshot(bg: *mut BifrostGuest) {
                     }
                     let k32: u32 = k;
                     let k_bytes = k32.to_le_bytes();
+                    // Track B P0 #7: AGG_KIND_QUANTIZE on a
+                    // PERCPU_ARRAY[1] represents an unkeyed
+                    // `@latency = quantize(...)`.  The map index
+                    // 0 is an internal lookup detail, not a
+                    // user-visible key — emit k_size=0 on the
+                    // wire so the host's CrossTargetAggReducer
+                    // keys this row identically to FreeBSD's
+                    // libdtrace-emitted empty-key quantize row
+                    // and folds both into one histogram cell.
+                    let (k_size, k_slice): (u32, &[u8]) = if agg_kind == AGG_KIND_QUANTIZE {
+                        (0, &[][..])
+                    } else {
+                        (4, &k_bytes[..])
+                    };
                     if pack_row(
                         &mut writer,
                         fd,
                         agg_kind,
                         map,
                         &k32 as *const u32 as *const core::ffi::c_void,
-                        4,
-                        &k_bytes,
+                        k_size,
+                        k_slice,
                     ) {
                         packed += 1;
                     }

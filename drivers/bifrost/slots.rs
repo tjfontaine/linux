@@ -70,6 +70,9 @@ pub(crate) struct BifrostSlot {
     pub(crate) rawtp_btp: *mut bindings::bpf_raw_event_map,
     /// True when rawtp_link is currently registered.
     pub(crate) rawtp_registered: bool,
+    /// Profile-timer perf_event handle (one per-CPU; the MVP opens
+    /// CPU 0 only).  Null when no perf_event is registered.
+    pub(crate) perf_event: *mut bindings::perf_event,
 }
 
 impl BifrostSlot {
@@ -91,6 +94,7 @@ impl BifrostSlot {
             rawtp_link: core::mem::MaybeUninit::uninit(),
             rawtp_btp: core::ptr::null_mut(),
             rawtp_registered: false,
+            perf_event: core::ptr::null_mut(),
         }
     }
 }

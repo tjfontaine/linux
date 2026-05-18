@@ -18,8 +18,8 @@ use crate::types::{
     BPF_INSN_WIRE_SIZE, MAP_DEF_WIRE_SIZE,
 };
 use crate::wire::{
-    PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM,
-    PROBE_TYPE_USDT,
+    PROBE_TYPE_PROFILE_TIMER, PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
+    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
 };
 
 /// Caps mirroring the historical inline scratch buffers. Bumping any of
@@ -282,6 +282,22 @@ pub(crate) unsafe fn parse_load_prog(
                 layout.uprobe_symbol[probe_len] = 0;
                 layout.uprobe_symbol_len = probe_len;
                 off += probe_len;
+            }
+            PROBE_TYPE_PROFILE_TIMER => {
+                // Track B P0 #6: trailer is one u64 period_ns.  We
+                // stash it in `uprobe_file_offset` (the only u64
+                // scratch field on `layout` today) so the attach
+                // dispatch can pass it through `AttachExt` without
+                // a separate field.  See attach.rs's
+                // `attach_slot_profile_timer` for the consumer.
+                if !need(off, 8) {
+                    pr_err!(
+                        "bifrost_guest: LOAD_PROG profile-timer trailer truncated (need 8 bytes)\n"
+                    );
+                    return Err(-(bindings::EINVAL as i32));
+                }
+                layout.uprobe_file_offset = read_u64_le_unaligned(base.add(off));
+                off += 8;
             }
             _ => {}
         }

@@ -6176,6 +6176,60 @@ int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, u64 *out_su
 EXPORT_SYMBOL_GPL(bifrost_map_lookup_sum_u64);
 
 /*
+ * Track B P0 #7: quantize-bucket-array reducer.  Mirrors
+ * bifrost_map_lookup_sum_u64 but per-bucket: each per-CPU value
+ * slot is an array of `n_buckets` u64s; we sum bucket-wise into
+ * `out_buckets[n_buckets]`.  Used by the Linux quantize agg
+ * snapshot writer to ship ONE row per (name, user-key) with the
+ * full bucket array as the value — same wire shape FreeBSD
+ * libdtrace emits for its quantize rows, so the cross-target
+ * reducer folds both kernels into one histogram cell.
+ */
+int bifrost_map_lookup_quantize_buckets(struct bpf_map *map,
+					const void *key,
+					u64 *out_buckets,
+					u32 n_buckets)
+{
+	void *val_ptr;
+	int cpu;
+	u32 i;
+	bool any = false;
+
+	if (!map || !map->ops || !out_buckets || !n_buckets)
+		return -EINVAL;
+	for (i = 0; i < n_buckets; i++)
+		out_buckets[i] = 0;
+
+	if (map->ops->map_lookup_percpu_elem) {
+		for_each_possible_cpu(cpu) {
+			const u64 *src;
+
+			val_ptr = map->ops->map_lookup_percpu_elem(
+				map, (void *)key, cpu);
+			if (!val_ptr)
+				continue;
+			src = (const u64 *)val_ptr;
+			for (i = 0; i < n_buckets; i++)
+				out_buckets[i] += src[i];
+			any = true;
+		}
+		return any ? 0 : -ENOENT;
+	}
+	if (!map->ops->map_lookup_elem)
+		return -EINVAL;
+	val_ptr = map->ops->map_lookup_elem(map, (void *)key);
+	if (!val_ptr)
+		return -ENOENT;
+	{
+		const u64 *src = (const u64 *)val_ptr;
+		for (i = 0; i < n_buckets; i++)
+			out_buckets[i] = src[i];
+	}
+	return 0;
+}
+EXPORT_SYMBOL_GPL(bifrost_map_lookup_quantize_buckets);
+
+/*
  * Per-cpu reduce shims for MIN/MAX/AVG aggregations. Same shape
  * as bifrost_map_lookup_sum_u64 but reduce by min/max instead of
  * sum, OR (for AVG) treat each per-cpu slot as a 16-byte

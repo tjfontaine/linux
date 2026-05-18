@@ -29,6 +29,8 @@
 #include <linux/scatterlist.h>
 #include <linux/uprobes.h>
 #include <linux/namei.h>
+#include <linux/perf_event.h>
+#include <uapi/linux/perf_event.h>
 
 /* Bifrost helper-proto resolver, defined in kernel/bpf/helpers.c.
  * Exposed here so bindgen picks it up for the bifrost_guest module. */
@@ -117,6 +119,13 @@ extern int bifrost_map_get_next_key(struct bpf_map *map, void *key, void *next_k
  * single u64; for non-percpu maps falls back to a single
  * map_lookup_elem read. */
 extern int bifrost_map_lookup_sum_u64(struct bpf_map *map, const void *key, unsigned long long *out_sum);
+/* Track B P0 #7: quantize-bucket-array reducer.  Per-cpu slot is
+ * `n_buckets * sizeof(u64)` bytes; sums bucket-wise across CPUs
+ * into `out_buckets[n_buckets]`. */
+extern int bifrost_map_lookup_quantize_buckets(struct bpf_map *map,
+					       const void *key,
+					       unsigned long long *out_buckets,
+					       unsigned int n_buckets);
 /* MIN/MAX reduce across per-cpu slots. Treat per-cpu value 0 as
  * sentinel for "this CPU never wrote" and skip it; -ENOENT if no
  * CPU has a non-zero value. value_size must be 8.

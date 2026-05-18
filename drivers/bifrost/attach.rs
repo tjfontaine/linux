@@ -13,14 +13,30 @@ use crate::symtab_snapshot::push_symtab_snapshot_cb;
 use crate::task_helpers::TaskRef;
 use crate::uprobe_handlers::{bifrost_uprobe_handler, bifrost_uretprobe_handler};
 use crate::wire::{
-    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE,
-    PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE, PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
+    PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_PROFILE_TIMER,
+    PROBE_TYPE_TRACEPOINT, PROBE_TYPE_UPROBE, PROBE_TYPE_UPROBE_BY_SYM, PROBE_TYPE_URETPROBE,
+    PROBE_TYPE_URETPROBE_BY_SYM, PROBE_TYPE_USDT,
 };
 use crate::{free_slot_prog, BifrostGuest, BIFROST_TRACING_LINK_OPS};
 
 extern "C" {
     fn bpf_get_raw_tracepoint(name: *const c_char) -> *mut bindings::bpf_raw_event_map;
     fn bpf_put_raw_tracepoint(btp: *mut bindings::bpf_raw_event_map);
+    fn perf_event_create_kernel_counter(
+        attr: *mut bindings::perf_event_attr,
+        cpu: c_int,
+        task: *mut bindings::task_struct,
+        callback: Option<unsafe extern "C" fn()>,
+        context: *mut c_void,
+    ) -> *mut bindings::perf_event;
+    fn perf_event_release_kernel(event: *mut bindings::perf_event) -> c_int;
+    fn perf_event_set_bpf_prog(
+        event: *mut bindings::perf_event,
+        prog: *mut bindings::bpf_prog,
+        bpf_cookie: u64,
+    ) -> c_int;
+    fn cpu_possible_mask() -> *const bindings::cpumask;
+    fn num_online_cpus() -> u32;
     fn bpf_probe_register(
         btp: *mut bindings::bpf_raw_event_map,
         link: *mut bindings::bpf_raw_tp_link,
@@ -135,6 +151,13 @@ pub(crate) unsafe fn slot_family_attach(
                 ext.uprobe_symbol,
                 bg,
             ),
+            PROBE_TYPE_PROFILE_TIMER => attach_slot_profile_timer(
+                slot,
+                ext.uprobe_file_offset, // period_ns is carried in this slot
+                                        // by load_prog_parse; see
+                                        // `parse_profile_timer_trailer`.
+                bg,
+            ),
             _ => {
                 pr_err!(
                     "bifrost_guest: unsupported probe_type {} for target='{}' slot[{}] — bifrost driver no longer dispatches kprobe (probe_types 0/1)\n",
@@ -174,6 +197,10 @@ pub(crate) unsafe fn slot_family_cleanup(slot: usize, probe_type: u8) -> bool {
             | PROBE_TYPE_UPROBE_BY_SYM
             | PROBE_TYPE_URETPROBE_BY_SYM
             | PROBE_TYPE_USDT => cleanup_slot_uprobe(slot),
+            PROBE_TYPE_PROFILE_TIMER => {
+                cleanup_slot_profile_timer(slot);
+                false
+            }
             PROBE_TYPE_NONE => false,
             other => {
                 pr_err!(
@@ -204,8 +231,110 @@ fn slot_family_label(probe_type: u8) -> &'static str {
         PROBE_TYPE_UPROBE | PROBE_TYPE_URETPROBE => "uprobe",
         PROBE_TYPE_UPROBE_BY_SYM | PROBE_TYPE_URETPROBE_BY_SYM => "uprobe_by_sym",
         PROBE_TYPE_USDT => "usdt",
+        PROBE_TYPE_PROFILE_TIMER => "profile-timer",
         PROBE_TYPE_NONE => "none",
         _ => "unknown",
+    }
+}
+
+/// Profile-timer attach (Track B P0 #6).  Opens a single per-CPU
+/// (CPU 0 for the MVP) `perf_event` of type PERF_TYPE_SOFTWARE
+/// (1) / PERF_COUNT_SW_CPU_CLOCK (0) with the host-supplied
+/// `period_ns` sample period, then attaches the JIT'd BPF program
+/// via `perf_event_set_bpf_prog`.  The event handle is stashed on
+/// the slot so cleanup can release it at detach.
+unsafe fn attach_slot_profile_timer(
+    slot: usize,
+    period_ns: u64,
+    bg: *mut BifrostGuest,
+) -> c_int {
+    unsafe {
+        let jitted = slots_mut()[slot].prog.load(Ordering::Acquire);
+        if jitted.is_null() {
+            pr_err!(
+                "bifrost_guest: profile-timer slot[{}]: prog pointer missing — verifier path failed?\n",
+                slot,
+            );
+            return -(bindings::EINVAL as i32);
+        }
+        if period_ns == 0 {
+            pr_err!(
+                "bifrost_guest: profile-timer slot[{}]: period_ns=0 rejected (host should encode at least 1ns)\n",
+                slot,
+            );
+            return -(bindings::EINVAL as i32);
+        }
+        let mut attr = bindings::perf_event_attr::default();
+        attr.type_ = 1; // PERF_TYPE_SOFTWARE
+        attr.size = core::mem::size_of::<bindings::perf_event_attr>() as u32;
+        attr.config = 0; // PERF_COUNT_SW_CPU_CLOCK
+        attr.__bindgen_anon_1.sample_period = period_ns;
+        // sample_type=0 keeps the perf-event sample record minimal; the BPF
+        // program reads its own context (bpf_perf_event_data) — no
+        // raw-sample payload needed.
+        attr.sample_type = 0;
+        // Open per-CPU 0 only for the MVP.  Per-CPU iteration is a
+        // follow-up; profile-timer on CPU 0 still fires at the
+        // requested period and feeds the same per-CPU SHM ring the
+        // tracepoint path uses.
+        let event = perf_event_create_kernel_counter(
+            &mut attr as *mut _,
+            0,                       // cpu = 0
+            core::ptr::null_mut(),   // task = NULL (CPU-bound)
+            None,                    // callback (NULL → BPF takes the sample)
+            core::ptr::null_mut(),   // context
+        );
+        if (event as usize) >= (-4095isize as usize) {
+            // ERR_PTR encoding: returned pointer is in the [-4095, 0)
+            // range when the kernel signalled a negative errno.
+            let err = -((event as isize) as i32);
+            pr_err!(
+                "bifrost_guest: profile-timer slot[{}] perf_event_create_kernel_counter failed: {}\n",
+                slot,
+                err,
+            );
+            return -err.abs();
+        }
+        let r = perf_event_set_bpf_prog(event, jitted, 0);
+        if r != 0 {
+            pr_err!(
+                "bifrost_guest: profile-timer slot[{}] perf_event_set_bpf_prog failed: {}\n",
+                slot,
+                r,
+            );
+            perf_event_release_kernel(event);
+            return r;
+        }
+        slots_mut()[slot].perf_event = event;
+        // Mirror attach_slot_fbt: bump the high-water-mark slot
+        // counter so subsequent LOAD_PROGs land in slot+1 instead
+        // of clobbering this one.  Without this, the peer
+        // ExtraProg::Action's per-fire program overwrites the
+        // profile-timer's agg-chain program at slot[0] (or vice
+        // versa), depending on LOAD_PROG order.
+        BIFROST_NUM_KPROBES = slot + 1;
+        (*bg).kprobe_attached = true;
+        pr_info!(
+            "bifrost_guest: profile-timer slot[{}] attached: period_ns={} cpu=0\n",
+            slot,
+            period_ns,
+        );
+        0
+    }
+}
+
+/// Counterpart to `attach_slot_profile_timer`.  Releases the
+/// per-CPU perf_event handle if one was registered.
+unsafe fn cleanup_slot_profile_timer(slot: usize) {
+    unsafe {
+        if slot >= slots_mut().len() {
+            return;
+        }
+        let event = slots_mut()[slot].perf_event;
+        if !event.is_null() {
+            let _ = perf_event_release_kernel(event);
+            slots_mut()[slot].perf_event = core::ptr::null_mut();
+        }
     }
 }
 

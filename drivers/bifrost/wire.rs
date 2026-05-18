@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0 OR GPL-2.0
-// CANONICAL_SHA256: 89e11231c6fd7b175f763cd72bbfe3d03beed7461420d0e10e64ce344593f284
+// CANONICAL_SHA256: b5678f968750b7b6fd4c20d75a0a6d703bbb0686b3b093480bd81c9dd903ee76
 // CANONICAL_SOURCE: host/bifrost-wire/src/lib.rs
 //
 // VENDORED COPY of host/bifrost-wire/src/lib.rs.  The libkrunfw
@@ -201,6 +201,28 @@ pub const MAX_PROBE_SLOTS: usize = 256;
 /// each gets its own registration.
 pub const PROBE_TYPE_USDT: u8 = 9;
 
+/// Profile-timer attach.  The host emits `profile:::tick-Nms` /
+/// `profile:::tick-Nsec` clauses as a BPF_PROG_TYPE_PERF_EVENT
+/// program; the guest module opens one per-CPU
+/// `perf_event_create_kernel_counter` of type PERF_TYPE_SOFTWARE /
+/// PERF_COUNT_SW_CPU_CLOCK with `sample_period = period_ns`, and
+/// attaches the BPF program via the perf_event ioctl
+/// (`PERF_EVENT_IOC_SET_BPF`).  Trailer (after the 36-byte BFR7
+/// program header):
+///
+///   u64 period_ns
+///
+/// Track B P0 #6: needed for the one-shared-clause demo shape
+/// (`profile:::tick-100ms { @latency = quantize(...); }` routed to
+/// every kernel, no per-OS clause split).
+pub const PROBE_TYPE_PROFILE_TIMER: u8 = 10;
+// Marker so attach.rs's wildcard arm can name the new family in
+// its diagnostic and call into `attach_slot_profile_timer` once
+// the perf_event_create_kernel_counter binding lands.  See
+// load_prog_parse.rs for the period_ns trailer decode and
+// `bifrost_guest_attach_profile_timer` for the (to-land) attach.
+pub const PROBE_TYPE_PROFILE_TIMER_LABEL: &str = "profile-timer";
+
 // =====================================================================
 // Aggregation-kind discriminants.  Stored in the per-map flags
 // byte; the guest's snapshot worker dispatches reduce-by-kind.
@@ -227,6 +249,12 @@ pub const AGG_KIND_LQUANTIZE: u8 = 5;
 /// (`factor`, `low_mag`, `high_mag`, `steps_per_mag`) live in
 /// `xagg::LlquantizeParams`.
 pub const AGG_KIND_LLQUANTIZE: u8 = 6;
+/// `quantize()` aggregation (power-of-two histogram).  Track B P0
+/// #7: map shape is `BPF_MAP_TYPE_PERCPU_ARRAY` with key=u32 0 and
+/// value=`DTRACE_QUANTIZE_NBUCKETS * sizeof(u64) = 1016` bytes.
+pub const AGG_KIND_QUANTIZE: u8 = 7;
+pub const DTRACE_QUANTIZE_NBUCKETS: usize = 127;
+pub const QUANTIZE_VALUE_SIZE: u32 = (DTRACE_QUANTIZE_NBUCKETS * 8) as u32;
 
 // =====================================================================
 // SHMEM record probe-id magics.  Stored at offset 4 of every

@@ -109,7 +109,8 @@ use shmem_layout::{
     SHMEM_VERSION, SHMEM_VMA_CACHE_LEN, SHMEM_VMA_CACHE_OFF,
 };
 use wire::{
-    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_TRACEPOINT,
+    AGG_KIND_SUM, PROBE_TYPE_FENTRY, PROBE_TYPE_FEXIT, PROBE_TYPE_NONE, PROBE_TYPE_PROFILE_TIMER,
+    PROBE_TYPE_TRACEPOINT,
 };
 
 module! {
@@ -988,6 +989,26 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                                 }
                             }
 
+                            // profile-timer probes (PROBE_TYPE_PROFILE_TIMER,
+                            // Track B P0 #6): the BPF program runs from a
+                            // perf_event sample callback, so route through
+                            // bifrost_set_prog_type(BPF_PROG_TYPE_PERF_EVENT)
+                            // before the verifier sees it.  No
+                            // attach_btf_id setup — perf-event programs
+                            // don't go through check_attach_btf_id either.
+                            if probe_type == PROBE_TYPE_PROFILE_TIMER
+                                && !(*prog).aux.is_null()
+                            {
+                                // BPF_PROG_TYPE_PERF_EVENT = 7.
+                                let r = bindings::bifrost_set_prog_type(prog, 7);
+                                if r != 0 {
+                                    pr_err!(
+                                        "bifrost_guest: bifrost_set_prog_type(PERF_EVENT) failed: {}\n",
+                                        r
+                                    );
+                                }
+                            }
+
                             // Layer 2: hand the prog to the kernel verifier
                             // before JIT. Verifier resolves pseudo-ldimm64
                             // (real_fd → bpf_map*), validates instruction
@@ -998,8 +1019,10 @@ extern "C" fn bifrost_worker_thread(data: *mut c_void) -> c_int {
                             let verr = bindings::bifrost_verify_prog(&mut prog_p);
                             if verr != 0 {
                                 pr_err!(
-                                    "bifrost_guest: bifrost_verify_prog failed: {}\n",
-                                    verr
+                                    "bifrost_guest: bifrost_verify_prog failed: {} (probe_type={}, prog.type={})\n",
+                                    verr,
+                                    probe_type,
+                                    (*prog_p).type_,
                                 );
                                 bpf_prog_free(prog_p);
                                 for j in 0..(*bg).num_maps as usize {
